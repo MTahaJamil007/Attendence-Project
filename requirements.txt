@@ -1,0 +1,18 @@
+# Runtime dependencies EXCEPT torch/torchvision.
+#
+# torch must be installed first, from the CUDA index, or pip resolves the
+# CPU-only build from PyPI and the whole system silently runs at 3-8 FPS -
+# the exact defect this project exists to fix:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#
+# Do NOT add torch here with --extra-index-url: PyPI can win that race and
+# install the CPU wheel.
+
+ultralytics>=8.4.0
+opencv-python>=4.10
+numpy>=1.26
+lap>=0.5.12          # BoT-SORT assignment; falls back to scipy if absent
+openpyxl>=3.1        # XLSX export (Phase 3)
+pyttsx3>=2.90        # roll-number speech (Phase 2)
+comtypes>=1.4        # SAPI backend for pyttsx3 on Windows

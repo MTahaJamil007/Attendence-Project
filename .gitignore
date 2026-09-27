@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+logs/
+evidence/
+*.pt
+*.engine
+data/seatmap.json
