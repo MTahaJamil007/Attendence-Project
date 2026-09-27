@@ -7,14 +7,16 @@ window means Absent.
 See [PLAN.md](PLAN.md) for the full build plan and the review of the predecessor
 (`SmartRollCall.exe`) whose defects this design exists to fix.
 
-**Status: Phases 0, 1 and 2 are built and verified on the real hardware.**
-Phase 3 (evidence images + CSV/XLSX export) and Phase 4 (calibration on recorded
-footage) are not implemented yet, so the Export button currently reports that it
-is unavailable.
+**Status: all four phases are built and verified on the real hardware.**
 
-115 tests pass, the config contract check is clean, the end-to-end pipeline runs,
-and the application launches with both windows. See
-[Measured on this hardware](#measured-on-this-hardware).
+185 tests pass, the config contract check is clean, the end-to-end pipeline runs,
+the application launches with both windows, a complete roll call exports a
+register, a workbook, per-decision telemetry and evidence images, and the
+calibration toolchain sweeps thresholds against labelled footage.
+
+Two things still need *you*, not more code: a real classroom recording to
+calibrate against, and the physical camera test. See
+[What still needs doing](#what-still-needs-doing).
 
 ---
 
@@ -47,7 +49,7 @@ The torch wheel is ~2.44 GB, so the first install takes a while.
 ```bash
 run.bat app          # the application
 run.bat check        # runtime gate: CUDA, torchvision::nms, FP16
-run.bat test         # config contract + 115 tests (no GPU or camera needed)
+run.bat test         # config contract + 185 tests (no GPU or camera needed)
 run.bat ui           # UI construction/rendering tests only
 run.bat cameras      # list every working camera
 run.bat benchmark    # measure FPS, pick model + imgsz
@@ -83,7 +85,9 @@ src/
   liveness.py            the watchdog rule, isolated so it can be tested alone
   roster.py              CSV/paste loading, shortest-unique spoken calls
   speech.py              pyttsx3 worker thread, warmed at startup
-  session.py             roll-call state machine
+  session.py             roll-call state machine + per-decision telemetry
+  evidence.py            captioned crop of the credited student
+  export.py              CSV / XLSX / session JSON, with a Pending guard
   main.py                entry point; runs the Phase 0 gate before any UI
   ui/console.py          teacher window: video, roster, controls, status
   ui/roll_display.py     student-facing fullscreen display
@@ -93,6 +97,11 @@ tools/
   test_detector.py       33 scoring / temporal / gating tests, no torch needed
   test_liveness.py       20 watchdog tests, incl. replay of the predecessor's stalls
   test_session.py        49 state-machine tests, incl. a replayed 52s stall
+  test_export.py         40 export + evidence tests, incl. the Pending guard
+  test_calibrate.py      30 calibration replay/sweep tests on synthetic footage
+  record.py              scripted ground-truth recorder
+  extract.py             pose inference cached to .npz, once per model
+  calibrate.py           threshold sweep, recall/precision report, --apply
   test_ui.py             13 UI construction/render tests, real windows, ~1s
   check_config.py        code/config contract + value sanity checks
   benchmark.py           model x imgsz sweep with stage split and validity warnings
@@ -428,6 +437,204 @@ audible check that output and volume work before a class is waiting on it.
 
 ---
 
+## Phase 3 — evidence and export
+
+**Export** writes three files per session into
+`~/Documents/SmartRollCall Attendance` (the predecessor's folder, so an existing
+habit keeps working), or wherever `output.dir` points:
+
+```
+attendance_<stamp>.csv     the register
+attendance_<stamp>.xlsx    formatted, with a Summary sheet
+session_<stamp>.json       config + runtime + one record per decision
+evidence/<stamp>/<roll>.jpg
+```
+
+### CSV
+
+The first five columns are byte-for-byte the predecessor's — `Roll Number, Name,
+Status, Marked At, Evidence` — so anything already reading those files keeps
+working. Three columns are added: `Track ID`, `Score`, `Evidence Image`.
+
+Written as **utf-8-sig**, because Excel misreads a plain UTF-8 CSV. That is also
+why roster loading reads utf-8-sig.
+
+### Pending is never silently exported as Absent
+
+One of the predecessor's eight saved runs is twenty rows of `Pending` with empty
+timestamps, written by an export that did not check and told nobody. Here an
+unfinished roster is counted, the console asks before continuing, the rows stay
+`Pending` with no fabricated timestamp, and the workbook's Summary sheet carries
+an explicit `WARNING: n student(s) were never called`.
+
+### Evidence images
+
+A captioned crop of the credited student at the moment of the mark: roll number
+and name burned in on the left, score, track ID and time on the right.
+
+The crop is deliberately **not** drawn over with the pose skeleton — the skeleton
+is useful for tuning and is shown live in the operator view, but it obscures
+exactly the thing an evidence image exists to show. Crops smaller than
+`evidence_min_width` are upscaled, because a back-row student 90 px tall is
+legitimate for detection but useless to look at.
+
+Paths are recorded **relative to the output folder**, so the CSV, workbook and
+images can be moved or archived together without the references breaking.
+`session_*.json` records the absolute base, and so does the workbook Summary sheet.
+
+Capture never raises. A failed disk write returns an empty path and the attendance
+mark still stands — losing a photo must not lose a register entry.
+
+> **Privacy.** These are photographs of students. Where they are stored, who can
+> read them and how long they are kept are decisions for the institution, not for
+> this program. `output.save_evidence_images: false` disables capture entirely, and
+> the images live next to the attendance files so one retention policy can cover
+> both.
+
+### Session telemetry, and the track-reuse audit
+
+`session_*.json` carries the full config snapshot, runtime details (model, camera,
+FPS) and one record per decision:
+
+```json
+{
+  "roll": "SP25-BCS-001", "status": "Present", "track_id": 100,
+  "contenders": [100], "confirmed": [100],
+  "seconds_to_decide": 1.7, "window_extended": false,
+  "fps": 15.2, "capture_fps": 15.0
+}
+```
+
+This is what makes Phase 4 threshold tuning possible after the fact — you can see
+how long real students took to respond and how often the window had to be extended.
+
+It also carries a **`track_reuse`** block. Rule B is supposed to make it impossible
+for one tracked person to be credited for two roll numbers, so this should always
+be empty:
+
+```json
+"track_reuse": { "3": ["SP25-BCS-001", "SP25-BCS-004"] }
+```
+
+If it is ever non-empty, tracker IDs are churning and the anti-proxy guarantee is
+weaker than designed. This exists because a real session on this machine credited
+two different roll numbers from near-identical positions, and nothing in the CSV
+could say whether that was one person tracked twice or a legitimate reset. Now it
+can.
+
+---
+
+## Phase 4 — calibration
+
+This is the step that turns the thresholds from defensible-looking defaults into
+measured choices. Everything before it was validated against synthetic poses, which
+prove the maths is right but say nothing about whether 0.55 is the correct enter
+threshold for *your* room, *your* camera and *your* students.
+
+Three commands:
+
+```bash
+run.bat record    --name classroom-1          # capture labelled footage
+run.bat extract   --name classroom-1          # run the model once, cache keypoints
+run.bat calibrate --name classroom-1          # sweep thresholds, report recall/precision
+run.bat calibrate --name classroom-1 --apply  # write the winner into config.json
+```
+
+### Ground truth comes for free
+
+`record.py` runs a scripted protocol: it tells the subject what to do and when, and
+writes the intervals it asked for as labels. Nobody hand-labels video afterwards.
+
+The script deliberately contains **more distractors than genuine raises** —
+scratching, stretching, waving, holding a phone to the face, leaning on an elbow.
+Recall is easy to judge informally ("it saw my hand"); precision against
+distractors is not, and a detector that fires on someone scratching their head will
+quietly mark absent students present all term.
+
+Per-frame timestamps are recorded as they actually happened, not as
+`frame_index / nominal_fps`. This camera delivers 15 FPS with jitter, and the
+temporal filter is driven by real elapsed time — calibrating against idealized
+timestamps would tune for a frame rate that never existed.
+
+### The pose cache is what makes a sweep possible
+
+Inference costs ~40 ms per frame, so a five-minute recording is about three minutes
+of GPU time. A sweep over a few thousand threshold combinations that re-ran the
+model each time would take **days**.
+
+But scoring and temporal filtering are pure Python over keypoints that do not
+change when a threshold changes. So `extract.py` runs the model **once** per
+(model, imgsz) pair and caches keypoints to an `.npz`; every subsequent sweep reads
+that cache and finishes in seconds. Extracting with several models lets the sweep
+compare them on identical footage.
+
+The sweep itself is two-level: scores are computed once per distinct *scorer*
+configuration and reused across every *temporal* combination, rather than
+recomputing them for each.
+
+### The replay mirrors production exactly
+
+Not approximately:
+
+* detections are grouped per frame and fed to the tracker in a **single** update —
+  feeding one track at a time would make each look momentarily unseen to the
+  others, which is the bug that broke Rule A in Phase 2;
+* the tracker is armed at each segment boundary, exactly as it is when a roll
+  number is called;
+* `min_person_height_px` and the untracked-detection filter are applied as
+  `VideoWorker` applies them;
+* real recorded timestamps drive the time-constant filter.
+
+If the replay did not match production, its numbers would describe a system nobody
+ships.
+
+### Reading the output
+
+```
+   recall    prec      F1   TP   FN   FP   TN   settings
+   100.0%  100.0%   1.000    3    0    0   10   enter=0.55  hold=0.6  tau=0.18  straight=0.3
+```
+
+A baseline row shows how the *current* `config.json` performs on the same footage,
+so you can see whether tuning actually helped.
+
+Ranking is by F1, then recall: among equally balanced settings it prefers the one
+that misses fewer real students, because a false absence is the costlier error.
+
+The recommendation is the best setting meeting `--target-recall` (default 98%) and
+`--max-fp-rate` (default 1%). When nothing qualifies it says so plainly and reports
+the best available, rather than presenting a threshold that only looks good.
+
+False positives are attributed to the action that caused them:
+
+```
+false positives by action: scratch x3, phone x1
+```
+
+That is far more actionable than a bare precision number — it tells you which
+distractor the geometry is weak against.
+
+### Caveats the tool enforces
+
+* **Fewer than 20 segments** triggers a warning: one flipped decision moves recall
+  by several percent, so record more repetitions (`--reps`) before trusting it.
+* **No usable detections** stops the sweep entirely with a message pointing at
+  camera placement. No threshold can recover a subject the detector never sees, and
+  a sweep over zero data would happily report 0% for everything as if that were
+  information.
+* `--apply` backs up `config.json` to `config.json.bak` before writing.
+
+### This has not been run on real footage yet
+
+The machinery is tested end-to-end on synthetic recordings — clean footage scores
+100% recall with zero false positives, a permissive threshold correctly admits
+`scratch`, `stretch` and `phone`, and an unreachable one correctly loses recall.
+But no real classroom recording exists yet, so **the shipped thresholds remain
+reasoned defaults, not measured ones.** Record five minutes from the real camera
+position and that changes.
+
+---
+
 ## Key configuration
 
 Everything lives in `config.json`.
@@ -453,17 +660,39 @@ Everything lives in `config.json`.
 | `gating.require_single_hand` | `true` | Rule A |
 | `gating.one_credit_per_track` | `true` | Rule B |
 | `gating.seat_zone_lock` | `false` | Rule C, off by default |
+| `output.dir` | `""` | blank = `~/Documents/SmartRollCall Attendance` |
+| `output.save_evidence_images` | `true` | set false to disable photo capture entirely |
+| `output.evidence_jpeg_quality` | `88` | |
+| `output.evidence_min_width` | `240` | upscale small back-row crops to stay legible |
+| `output.write_xlsx` | `true` | |
+| `output.write_session_json` | `true` | needed for Phase 4 tuning |
 
 After editing, run `python tools/check_config.py`.
 
 ---
 
-## Not yet implemented
+## What still needs doing
 
-Phase 3 (evidence images, CSV/XLSX export with a Pending guard) and Phase 4
-(offline calibration sweep on recorded footage). The Export button reports that
-export is unavailable rather than pretending to work, and `main.py` wires in an
-exporter and an evidence store if those modules appear.
+Neither of these is a code task.
+
+**1. The physical camera test.** Mount the webcam where it will actually live and
+run `run.bat preview`. Confirm every seat you care about gets a skeleton drawn on
+it. If the back row has no skeleton, that is a placement problem and no threshold
+fixes it. This remains the highest risk in the project.
+
+**2. A real calibration recording.** The thresholds are reasoned defaults validated
+against synthetic poses, not measured ones. Five minutes from the real camera
+position turns them into measured choices:
+
+```bash
+run.bat record    --name classroom-1 --reps 3
+run.bat extract   --name classroom-1
+run.bat calibrate --name classroom-1
+```
+
+Also worth knowing: the built-in camera on this machine caps at 15 FPS. The
+detector is frame-rate independent by design so it works, but a 30 FPS 1080p USB
+webcam would roughly halve confirmation latency.
 
 The microphone/voice feature from the predecessor is **deliberately not carried
 over**. It was RMS energy thresholding, not speech recognition, and a noise hit

@@ -1,9 +1,16 @@
 # Hand-Raise Attendance System — Review & 1-Day Build Plan
 
-> **Build status (2026-09-27): Phases 0, 1 and 2 are built and verified on the
-> real hardware.** 115 tests pass, the config contract is clean, the end-to-end
-> pipeline runs, and the application launches with both windows. See README.md
-> for the measured numbers.
+> **Build status (2026-09-27): all four phases are built and verified on the real
+> hardware.** 185 tests pass, the config contract is clean, the end-to-end
+> pipeline runs, the application launches with both windows, a complete roll call
+> exports a register, a workbook, per-decision telemetry and evidence images, and
+> the calibration toolchain sweeps thresholds against labelled footage.
+>
+> Two things still need a human rather than more code: the **physical camera
+> test** (highest remaining risk, and not a software risk), and a **real
+> classroom recording** to calibrate against. Until that recording exists the
+> thresholds are reasoned defaults validated on synthetic poses, not measured
+> ones. See README.md.
 >
 > Phase 2 exposed a design bug in Rule A: it counted only *confirmed* raises, but
 > two people never raise in the same frame, so the marginally earlier hand was

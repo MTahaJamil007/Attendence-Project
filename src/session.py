@@ -108,6 +108,10 @@ class Session:
         self.result_text: str = ""
         self.blocked_reason: str = ""
         self.last_marked: int = -1
+        # One record per decision, exported as session_*.json. Without this the
+        # CSV cannot answer questions like "was the same tracked person credited
+        # twice?", which is exactly the kind of thing that needs auditing.
+        self.telemetry: list[dict] = []
 
     # -- roster ------------------------------------------------------------
     def set_students(self, students: list[Student]) -> None:
@@ -115,6 +119,7 @@ class Session:
         self.current = -1
         self.phase = Phase.IDLE
         self.last_marked = -1
+        self.telemetry.clear()
         self.message = f"{len(students)} students loaded"
         self.tracker.reset()
         self.gate.reset_session()
@@ -130,6 +135,7 @@ class Session:
         self.current = -1
         self.last_marked = -1
         self.phase = Phase.IDLE
+        self.telemetry.clear()
         self.tracker.reset()
         self.gate.reset_session()
         self.message = "all marks cleared"
@@ -292,6 +298,29 @@ class Session:
         self._result_until = now + self.result_hold
         self.message = f"{st.roll}: {status}" + (f" ({evidence})" if evidence else "")
 
+        vstat = {}
+        try:
+            vstat = self.video.status()
+        except Exception:
+            pass
+        self.telemetry.append({
+            "roll": st.roll,
+            "status": status,
+            "evidence": evidence,
+            "marked_at": st.marked_at,
+            "track_id": st.track_id,
+            "score": st.score,
+            "call_started": round(self._call_started, 3),
+            "decided_at": round(now, 3),
+            "seconds_to_decide": round(now - self._call_started, 3),
+            "window_extended": self._extended,
+            "contenders": [t.track_id for t in self.tracker.contenders()],
+            "confirmed": [t.track_id for t in self.tracker.confirmed()],
+            "fps": round(vstat.get("fps") or 0.0, 1),
+            "capture_fps": round(vstat.get("capture_fps") or 0.0, 1),
+            "evidence_image": st.evidence_image,
+        })
+
     def mark_manual(self, present: bool, now: float) -> None:
         """Teacher override, also used to resolve an AMBIGUOUS call."""
         if self.current < 0 or self.current >= len(self.students):
@@ -325,6 +354,10 @@ class Session:
         st.track_id = None
         st.score = 0.0
         st.evidence_image = ""
+        for i in range(len(self.telemetry) - 1, -1, -1):
+            if self.telemetry[i].get("roll") == st.roll:
+                self.telemetry.pop(i)
+                break
         self.current = self.last_marked
         self.last_marked = -1
         self.phase = Phase.IDLE

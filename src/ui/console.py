@@ -309,7 +309,23 @@ class Console:
             ):
                 return
         try:
-            paths = self.exporter.export(self.session.students)
+            runtime = {}
+            try:
+                st = self.video.status()
+                runtime = {
+                    "model": st.get("model"),
+                    "camera": st.get("camera"),
+                    "fps": round(st.get("fps") or 0.0, 1),
+                    "capture_fps": round(st.get("capture_fps") or 0.0, 1),
+                    "half": st.get("half"),
+                }
+            except Exception:
+                pass
+            paths = self.exporter.export(
+                self.session.students,
+                telemetry=self.session.telemetry,
+                runtime=runtime,
+            )
         except Exception as exc:
             messagebox.showerror("Export", str(exc))
             return

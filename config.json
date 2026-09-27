@@ -96,6 +96,9 @@
   "output": {
     "dir": "",
     "save_evidence_images": true,
-    "evidence_jpeg_quality": 88
+    "evidence_jpeg_quality": 88,
+    "write_xlsx": true,
+    "write_session_json": true,
+    "evidence_min_width": 240
   }
 }
