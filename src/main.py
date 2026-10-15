@@ -36,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="start even without CUDA (too slow for a real session)")
     ap.add_argument("--config", default=None, help="path to an alternative config.json")
     ap.add_argument("--roster", default=None, help="load this roster CSV at startup")
+    ap.add_argument("--camera", default=None,
+                    help="camera to use: a local index (0, 1, ...) or a phone address "
+                         "such as 192.168.43.1:8080 (see run.bat phone)")
     args = ap.parse_args(argv)
 
     cfg = Config.load(args.config) if args.config else Config.load()
@@ -64,6 +67,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     video = VideoWorker(cfg, runtime_report=rep)
+    if args.camera:
+        video.set_source(args.camera)
+        print(f"camera: {args.camera}")
+    # Task Manager's GPU page does not graph the CUDA engine by default, so it
+    # shows ~0% while inference runs. Point at where the real figure is.
+    print("GPU load is shown in the console status bar (NVML); in Task Manager, "
+          "switch a GPU graph to 'Cuda' or 'Compute_0' to see it there.")
     tracker = TemporalRaiseTracker(cfg)
     gate = AttendanceGate(cfg)
     speech = SpeechWorker(cfg)

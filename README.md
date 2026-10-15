@@ -9,7 +9,7 @@ See [PLAN.md](PLAN.md) for the full build plan and the review of the predecessor
 
 **Status: all four phases are built and verified on the real hardware.**
 
-225 tests pass, the config contract check is clean, the end-to-end pipeline runs,
+352 tests pass, the config contract check is clean, the end-to-end pipeline runs,
 the application launches with both windows, a complete roll call exports a
 register, a workbook, per-decision telemetry and evidence images, and the
 calibration toolchain sweeps thresholds against labelled footage.
@@ -18,7 +18,29 @@ Two things still need *you*, not more code: a real classroom recording to
 calibrate against, and the physical camera test. See
 [What still needs doing](#what-still-needs-doing).
 
-### Latest revision: the voice calls every student, and a slight raise counts
+### Latest revision: one seat cannot answer twice, phone cameras, and the GPU question
+
+* **A student who already answered cannot answer for a second roll number from
+  the same seat** - even several calls later, even after the tracker has given
+  them a new ID. This was a real miss: the anti-proxy rule was keyed on the
+  tracker's ID, and IDs change when someone is hidden for a moment. The system now
+  remembers *where* each credited student sat and stops the call for the teacher,
+  drawing the seat and the hand on the video. No face recognition is involved. See
+  [Seat memory](#seat-memory-rule-d).
+* **Phone cameras, over Wi-Fi or a USB cable, with no internet.** Android or
+  iPhone, through the phone's hotspot, the laptop's hotspot, any shared Wi-Fi,
+  USB tethering or `adb`. A **Phone Camera** button finds the phone automatically,
+  and a weak link pauses the roll call instead of marking anyone absent. See
+  [Phone cameras](#phone-cameras-no-internet-needed).
+* **The GPU *is* being used; Task Manager does not show it.** Measured during a
+  run: Task Manager 0%, the GPU itself 56-59% busy at 75-80 W. The status bar now
+  shows the real figure. See [Is the GPU being used?](#is-the-gpu-being-used).
+* **A 2-second stall right after start-up is gone.** The first real frame after
+  the GPU warm-up took 2.06 s, because the warm-up used a different image shape and
+  skipped the tracker. It now warms up on the camera's real shape: first result
+  0.03 s after "ready", and the smoke test's liveness gaps fell from 348 to 3.
+
+### Previous revision: the voice calls every student, and a slight raise counts
 
 * **The machine now reads each registration number aloud** - "S P two five,
   B C S, zero zero seven" - and the student answers by raising a hand. Speech
@@ -66,10 +88,11 @@ The torch wheel is ~2.44 GB, so the first install takes a while.
 ```bash
 run.bat app          # the application
 run.bat check        # runtime gate: CUDA, torchvision::nms, FP16
-run.bat test         # config contract + 225 tests (no GPU or camera needed)
+run.bat test         # config contract + 352 tests (no GPU or camera needed)
 run.bat ui           # UI construction/rendering tests only
 run.bat voice        # speak a few calls and confirm the audio really plays
 run.bat cameras      # list every working camera
+run.bat phone        # find and test a phone camera (Wi-Fi, hotspot or USB)
 run.bat benchmark    # measure FPS, pick model + imgsz
 run.bat smoke        # headless end-to-end pipeline check (no window, RDP-safe)
 run.bat preview      # live detector view - run this in the real classroom
@@ -109,6 +132,10 @@ src/
   main.py                entry point; runs the Phase 0 gate before any UI
   ui/console.py          teacher window: video, roster, controls, status
   ui/roll_display.py     student-facing fullscreen display
+  ui/phone_dialog.py     find / connect a phone camera
+  netcam.py              phone cameras: MJPEG reader, reconnect, LAN + adb discovery
+  appearance.py          clothing-colour signature for the seat check (no faces)
+  gpu_monitor.py         real GPU load from NVML for the status bar
 data/
   botsort_static.yaml    BoT-SORT with motion compensation off (see below)
 tools/
@@ -120,7 +147,10 @@ tools/
   record.py              scripted ground-truth recorder
   extract.py             pose inference cached to .npz, once per model
   calibrate.py           threshold sweep, recall/precision report, --apply
-  test_ui.py             13 UI construction/render tests, real windows, ~1s
+  test_ui.py             21 UI construction/render tests, real windows, ~1s
+  test_seats.py          72 seat-memory tests, incl. the reported "answered twice" case
+  test_netcam.py         47 phone-camera tests against local imitation phone servers
+  phone_check.py         find a phone camera, measure its FPS and gaps (run.bat phone)
   voice_check.py         audible check that every call actually plays (run.bat voice)
   check_config.py        code/config contract + value sanity checks
   benchmark.py           model x imgsz sweep with stage split and validity warnings
@@ -373,10 +403,73 @@ student present.
   cannot answer for anyone else.
 - **Rule C** (optional) — a student's credited seat position is remembered; an
   answer from far away is flagged.
+- **Rule D** — one credit per *seat* per session; see
+  [Seat memory](#seat-memory-rule-d) below.
 
 Plus a **fresh-raise requirement**: a hand parked in the air cannot answer several
 consecutive roll numbers. A `fresh_lookback_sec` of 1.5 s still credits a student
 who raises the instant they hear their number, slightly before the window opens.
+
+### Seat memory (Rule D)
+
+**The miss it fixes.** A student answered for roll 9, sat through a few calls, and
+then raised for roll 31 - and was credited for both. Rule B should have refused,
+but Rule B is keyed on the tracker's ID, and tracker IDs are not permanent: hidden
+for a moment by someone walking past, a student comes back as a new ID, and Rule B
+sees a stranger. `tools/test_seats.py` replays exactly this and shows both halves:
+with seat memory off, the same person gets two Presents; with it on, the second
+call stops for the teacher.
+
+**What it remembers.** Every credited student's seat, as the midpoint of their
+shoulders. Not the box centre - raising an arm grows the box upward and drags its
+centre about 0.45 shoulder-widths, nearly half the way to the next seat, while the
+shoulder midpoint moves by less than 0.01. The anchor is smoothed over time
+(`temporal.anchor_tau_sec`), because keypoints jitter by a few pixels.
+
+**How "same seat" is decided.** Distances are in **shoulder widths**, the natural
+seat unit: two people side by side cannot have their shoulder midpoints much
+closer than one shoulder width without overlapping, while one person shifting in
+their seat stays well inside half of one.
+
+| raised hand vs. a seat already credited this session | result |
+|---|---|
+| within 0.5 shoulder widths | **same seat** - flagged |
+| 0.5-0.8 away and the clothing colours match | **same seat** (they leaned) - flagged |
+| 0.5-0.8 away, clothing differs or unknown | different seat - credited |
+| 1.0 or more away (the neighbour), even in the same white shirt | different seat - credited |
+| apparent size differs by more than 1.6x (a row behind) | different seat - credited |
+
+Clothing is a colour histogram of the chest, between the shoulders
+(`appearance.py`). No face is looked at or stored. It can only widen the radius a
+little for someone who leaned, never decide on its own, because half a class may
+wear white.
+
+**What the teacher sees.** The call stops in the AMBIGUOUS phase with the result
+**SAME SEAT**. On the video, a magenta **ring** marks the seat already credited
+(labelled `MARKED SP25-BCS-009`), a magenta **box** marks the hand raised now
+(`#57 SAME SEAT AS SP25-BCS-009`), and a line joins them. Every credited seat
+also carries a small cyan dot with the last digits of its roll number, so the
+room's map builds up as the call goes on. The student screen says **ALREADY MARKED
+- TEACHER WILL CHECK**. `P` or `A` resolves it; a flagged call never times out
+into a guess.
+
+If two hands are up and one of them is at a credited seat, that is shown as **TWO
+HANDS** with the message naming which hand is at whose seat.
+
+**Audit.** Each record in `session_*.json` now carries the credited `seat` and,
+when the call was stopped, a `flag` with the verdict, which roll's seat was hit,
+the distance and the clothing match - so "the system was sure" and "the teacher
+overrode a flag" are distinguishable afterwards.
+
+**Also changed.** BoT-SORT keeps a lost track for 150 frames (~5 s) instead of 30
+(`data/botsort_static.yaml`), so a student hidden briefly usually keeps their ID
+and Rule B catches them before Rule D is even needed. Seated students barely move,
+so the longer memory costs little in ID swaps.
+
+**Limits.** The seat check needs the shoulders: a student whose shoulders are
+hidden when they raise is checked by Rule B only. A student who genuinely changes
+seats mid-roll-call and sits exactly where someone already answered will be
+flagged (one key press). Set `gating.seat_memory: false` to switch it off.
 
 ### 4. A liveness watchdog
 
@@ -392,6 +485,100 @@ required to consult it, and `preview.py` shows the state explicitly:
 An infrastructure failure must never become an attendance record.
 
 ---
+
+## Cameras and the GPU
+
+### Phone cameras (no internet needed)
+
+A phone usually has a better camera than the laptop (1080p at 30 FPS, versus this
+laptop's 15 FPS built-in camera) and can be stood at the front of the room, high
+up, where it sees every row. The phone and laptop only need to share a *local*
+link. Nothing goes to the internet, so a building with unusable internet is fine.
+
+**1. Install a free camera app on the phone.**
+
+| phone | app | default address |
+|---|---|---|
+| Android | **IP Webcam** (Pavel Khlebovich) - press *Start server* | `http://<phone>:8080/video` |
+| Android or iPhone | **DroidCam** - open the app | `http://<phone>:4747/video` |
+
+Any other app that serves MJPEG or JPEG snapshots over HTTP also works with its
+full URL, as do `rtsp://` streams. In the app, set the video to **1280x720** (or
+1920x1080 for a big room), JPEG quality ~70, audio off, and keep the screen awake.
+
+**2. Connect phone and laptop - pick one.**
+
+| link | how | notes |
+|---|---|---|
+| Phone's hotspot | turn on the hotspot (mobile data can be **off**), join it from the laptop | simplest; the phone is the hotspot's gateway, found first |
+| Laptop's hotspot | Settings > Network > Mobile hotspot on, join it from the phone | if Windows refuses without an internet connection, use the phone's hotspot |
+| Same Wi-Fi | both on any Wi-Fi | campus Wi-Fi often blocks device-to-device traffic; a hotspot avoids that |
+| USB, Android | plug in, Settings > Hotspot & tethering > **USB tethering** | no Wi-Fi at all; the cable also charges the phone |
+| USB, Android + adb | enable USB debugging, put Google's `platform-tools` in the project folder | **Find phone** runs `adb forward` itself; download platform-tools before going somewhere without internet |
+| USB, iPhone | **Personal Hotspot** on, plug in the cable | needs Apple's device driver (the *Apple Devices* or iTunes app) on the laptop |
+
+**3. Connect.** In the app press **Phone Camera** > **Find phone** - it checks
+the laptop's local networks (and `adb`), proves each hit really is a camera, and
+fills in the address - then **Connect**. Or type the address the phone app shows,
+e.g. `192.168.43.1:8080`. The last address is remembered. Also from the command
+line:
+
+```bash
+run.bat phone                       # find the phone, measure FPS and frame gaps
+run.bat phone 192.168.43.1:8080     # test one address
+run.bat app --camera 192.168.43.1:8080
+run.bat preview 192.168.43.1:8080   # live detector view from the phone
+```
+
+`run.bat phone` reports the delivered FPS and the worst gap between frames, and
+warns when the link is too slow or too unreliable for a roll call. Run it in the
+room before class.
+
+**Weak Wi-Fi is handled, not just tolerated.** The stream reader reconnects by
+itself with a short backoff. While the phone is unreachable no inference results
+arrive, the liveness watchdog puts the call into **STALLED**, the countdown
+freezes, and nobody is marked absent; when the phone comes back the call resumes
+where it was. The status bar shows `phone reconnecting` with the reason. Switching
+cameras opens the new one *before* closing the old, so a mistyped address leaves
+the current camera running.
+
+**Why not just `cv2.VideoCapture(url)`.** FFMPEG buffers network video, and
+inference must score the newest view of the room. `netcam.py` reads the MJPEG
+stream itself and, when frames have piled up, decodes only the newest one (tested:
+from a 12-frame backlog it returns frame 15, not frame 1). Every socket operation
+has a timeout, so a phone walking out of range cannot hang the capture thread.
+
+Measured end-to-end here, with the laptop webcam relayed as an MJPEG phone stream
+at 1280x720: 30.2 FPS delivered, worst frame gap 55 ms, inference 30 ms/frame on
+`cuda:0`, pipeline keeping up.
+
+A phone mounted in portrait: set `camera.rotate` to 90 or 270.
+
+### Is the GPU being used?
+
+Yes. Task Manager's GPU page graphs the **3D**, **Copy** and **Video** engines by
+default; PyTorch runs on the **Cuda / Compute** engine, which is not one of them.
+Measured on this laptop during `run.bat smoke`:
+
+| | Task Manager (default graphs) | NVML / `nvidia-smi` |
+|---|---|---|
+| utilization | 0% | **56-59%** |
+| memory | 0.5 GB dedicated | 487 MB |
+| power / clock | - | **75-80 W**, 1.6-1.9 GHz (idle: 13 W, 300 MHz) |
+
+The 0.5 GB of dedicated memory Task Manager *does* show is the model. The Intel
+GPU's few percent is the screen: on this laptop the Intel GPU drives the display,
+including the app's windows.
+
+* The console status bar now shows the inference device and the live load, e.g.
+  `cuda:0   gpu  57% 0.5GB 76W`, read from NVML (the same counters as
+  `nvidia-smi`).
+* To see it in Task Manager: Performance > GPU 0, click the name above one of the
+  small graphs (e.g. "3D") and choose **Cuda** (or **Compute_0**).
+* Or in a terminal: `nvidia-smi -l 1`.
+
+The device is read back from the model after warm-up, not assumed from the config,
+so `cuda:0` in the status bar is where inference actually ran.
 
 ## Phase 2 — the roll call
 
@@ -770,6 +957,9 @@ Everything lives in `config.json`.
 | `model.max_consecutive_failures` | `10` | transient inference errors tolerated before giving up |
 | `model.min_person_height_px` | `90` | below this, keypoints are noise |
 | `camera.fourcc` | `MJPG` | required for 1080p30 over USB 2.0 |
+| `camera.source` | `""` | blank = local camera; or a phone address / URL (`192.168.43.1:8080`) |
+| `camera.rotate` | `0` | 90 / 180 / 270 for a phone mounted sideways |
+| `camera.network_timeout_sec` | `3.0` | per-read limit on a phone stream before it reconnects |
 | `raise.weights` | — | four ramped features, must sum to 1.0 |
 | `raise.straightness_floor` | `0.30` | posture multiplier floor |
 | `raise.ramps.forearm_vertical` | `[45, 20]` | degrees from vertical; an upright forearm passes the posture check even with the elbow down |
@@ -789,6 +979,12 @@ Everything lives in `config.json`.
 | `gating.require_single_hand` | `true` | Rule A |
 | `gating.one_credit_per_track` | `true` | Rule B |
 | `gating.seat_zone_lock` | `false` | Rule C, off by default |
+| `gating.seat_memory` | `true` | Rule D: one credit per seat per session |
+| `gating.seat_radius_shoulders` | `0.5` | same seat on position alone |
+| `gating.seat_appearance_radius_shoulders` | `0.8` | same seat if the clothing also matches (must stay below 1.0, a neighbour) |
+| `gating.seat_appearance_min_similarity` | `0.85` | clothing-colour match needed for the wider radius |
+| `gating.seat_scale_ratio_max` | `1.6` | apparent-size ratio beyond which it is another row |
+| `temporal.anchor_tau_sec` | `0.4` | smoothing of the seat anchor |
 | `output.dir` | `""` | blank = `~/Documents/SmartRollCall Attendance` |
 | `output.save_evidence_images` | `true` | set false to disable photo capture entirely |
 | `output.evidence_jpeg_quality` | `88` | |
@@ -802,14 +998,21 @@ After editing, run `python tools/check_config.py`.
 
 ## What still needs doing
 
-Neither of these is a code task.
+None of these is a code task.
 
 **1. The physical camera test.** Mount the webcam where it will actually live and
 run `run.bat preview`. Confirm every seat you care about gets a skeleton drawn on
 it. If the back row has no skeleton, that is a placement problem and no threshold
 fixes it. This remains the highest risk in the project.
 
-**2. A real calibration recording.** The thresholds are reasoned defaults validated
+**2. A real classroom check of seat memory.** The radii are derived from body
+proportions and verified on synthetic seating, not yet on a real room. In the
+first real session, watch the cyan seat dots: each should sit on the student's
+chest. If neighbours on crowded benches get flagged, lower
+`seat_appearance_radius_shoulders` toward 0.6; `session_*.json` records the
+distance of every flag to tune from.
+
+**3. A real calibration recording.** The thresholds are reasoned defaults validated
 against synthetic poses, not measured ones. Five minutes from the real camera
 position turns them into measured choices:
 
@@ -820,8 +1023,9 @@ run.bat calibrate --name classroom-1
 ```
 
 Also worth knowing: the built-in camera on this machine caps at 15 FPS. The
-detector is frame-rate independent by design so it works, but a 30 FPS 1080p USB
-webcam would roughly halve confirmation latency.
+detector is frame-rate independent by design so it works, but a 30 FPS 1080p
+camera - a USB webcam, or a phone (`run.bat phone`) - roughly halves confirmation
+latency.
 
 The microphone/voice feature from the predecessor is **deliberately not carried
 over**. It was RMS energy thresholding, not speech recognition, and a noise hit

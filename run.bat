@@ -1,6 +1,6 @@
 @echo off
 REM Task launcher.
-REM Usage: run.bat [app|check|test|ui|voice|cameras|benchmark|smoke|preview]
+REM Usage: run.bat [app|check|test|ui|voice|cameras|phone|benchmark|smoke|preview]
 REM Calibration: run.bat [record|extract|calibrate] -- see README
 setlocal
 set PY=.venv\Scripts\python.exe
@@ -17,6 +17,7 @@ if /i "%1"=="test"      goto test
 if /i "%1"=="ui"        goto uitest
 if /i "%1"=="voice"     goto voice
 if /i "%1"=="cameras"   goto cameras
+if /i "%1"=="phone"     goto phone
 if /i "%1"=="benchmark" goto benchmark
 if /i "%1"=="smoke"     goto smoke
 if /i "%1"=="preview"   goto preview
@@ -24,11 +25,11 @@ if /i "%1"=="record"    goto record
 if /i "%1"=="extract"   goto extract
 if /i "%1"=="calibrate" goto calibrate
 echo Unknown task "%1".
-echo Valid: app check test ui voice cameras benchmark smoke preview record extract calibrate
+echo Valid: app check test ui voice cameras phone benchmark smoke preview record extract calibrate
 exit /b 1
 
 :app
-%PY% src\main.py %2 %3 %4
+%PY% src\main.py %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :check
@@ -48,6 +49,10 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 %PY% tools\test_calibrate.py
 if errorlevel 1 exit /b 1
+%PY% tools\test_seats.py
+if errorlevel 1 exit /b 1
+%PY% tools\test_netcam.py
+if errorlevel 1 exit /b 1
 %PY% tools\test_ui.py
 exit /b %errorlevel%
 
@@ -63,16 +68,20 @@ exit /b %errorlevel%
 %PY% src\camera.py
 exit /b %errorlevel%
 
+:phone
+%PY% tools\phone_check.py %2 %3 %4
+exit /b %errorlevel%
+
 :benchmark
 %PY% tools\benchmark.py %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :smoke
-%PY% tools\smoke.py %2 %3
+%PY% tools\smoke.py %2 %3 %4 %5
 exit /b %errorlevel%
 
 :preview
-%PY% tools\preview.py
+%PY% tools\preview.py %2
 exit /b %errorlevel%
 
 :record

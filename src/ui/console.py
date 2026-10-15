@@ -12,6 +12,7 @@ and the ambiguity rule depends on there being a human to defer to.
 
 from __future__ import annotations
 
+import json
 import time
 import tkinter as tk
 from pathlib import Path
@@ -21,11 +22,15 @@ import cv2
 from PIL import Image, ImageTk
 
 from annotate import annotate
+from gpu_monitor import GpuMonitor
 from roster import PRESENT, RosterError, load_csv, parse_pasted, summarize
 from session import Phase, Session
+from ui.phone_dialog import PhoneDialog
 from ui.roll_display import RollDisplay
 
 APP_TITLE = "Smart Roll Call - Hand Raise Attendance"
+# The last phone address used, so in class the teacher only has to press Connect.
+LAST_CAMERA_FILE = Path(__file__).resolve().parents[2] / "data" / "last_camera.json"
 
 DARK = "#15151a"
 PANEL = "#1d1d24"
@@ -61,6 +66,10 @@ class Console:
         self._last_frame_index = -1
         self._roster_sig = None
         self._devices_started = False
+        self._phone_dialog: PhoneDialog | None = None
+        # NVML, not Task Manager: Task Manager's default GPU graphs do not include
+        # the CUDA engine, so it reads 0% while the model runs. See gpu_monitor.py.
+        self.gpu = GpuMonitor()
 
         root.title(APP_TITLE)
         root.geometry("1560x920")
@@ -106,6 +115,7 @@ class Console:
         self.btn_devices = ttk.Button(bar, text="Start Camera", command=self.start_devices)
         self.btn_devices.pack(side="left")
         ttk.Button(bar, text="Switch Camera", command=self.switch_camera).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Phone Camera", command=self.phone_camera).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Roll Screen", command=self.open_display).pack(side="left", padx=(6, 0))
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         self.btn_start = ttk.Button(bar, text="Start Attendance", command=self.start_attendance)
@@ -243,6 +253,51 @@ class Console:
             return
         self.video.request_next_camera()
         self._flash("switching camera")
+
+    def phone_camera(self) -> None:
+        if self._phone_dialog is not None:
+            try:
+                if self._phone_dialog.win.winfo_exists():
+                    self._phone_dialog.win.lift()
+                    return
+            except Exception:
+                pass
+        initial = self._last_phone() or ""
+        self._phone_dialog = PhoneDialog(
+            self.root, initial, on_connect=self._connect_phone, on_local=self._use_local_camera
+        )
+
+    def _connect_phone(self, address: str) -> None:
+        self._save_last_phone(address)
+        if self._devices_started:
+            self.video.request_source(address)
+            self._flash(f"connecting to phone camera {address}")
+        else:
+            self.video.set_source(address)
+            self.start_devices()
+
+    def _use_local_camera(self) -> None:
+        if self._devices_started:
+            self.video.request_source("usb")
+            self._flash("switching to the laptop / USB camera")
+        else:
+            self.video.set_source("")
+            self._flash("the laptop / USB camera will be used")
+
+    @staticmethod
+    def _last_phone() -> str:
+        try:
+            return str(json.loads(LAST_CAMERA_FILE.read_text(encoding="utf-8")).get("phone", ""))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _save_last_phone(address: str) -> None:
+        try:
+            LAST_CAMERA_FILE.parent.mkdir(parents=True, exist_ok=True)
+            LAST_CAMERA_FILE.write_text(json.dumps({"phone": address}), encoding="utf-8")
+        except Exception:
+            pass
 
     def open_display(self) -> None:
         if self.display is not None and self.display.alive:
@@ -388,7 +443,9 @@ class Console:
             return
         lw = max(160, self.video_label.winfo_width())
         lh = max(120, self.video_label.winfo_height())
-        view = annotate(snap.frame, snap, self.cfg, track_states=self.tracker.states)
+        flag = self.session.flag if self.session.phase is Phase.AMBIGUOUS else None
+        view = annotate(snap.frame, snap, self.cfg, track_states=self.tracker.states,
+                        seats=list(self.gate.seats.values()), flag=flag)
         h, w = view.shape[:2]
         scale = min(lw / w, lh / h)
         if scale < 1.0:
@@ -470,6 +527,7 @@ class Console:
         cam_fps = st.get("capture_fps") or 0.0
         bits = [
             f"{st['stage']:<18}",
+            st["camera"],
             f"cam {cam_fps:4.1f}fps",
             f"ai {snap.fps:4.1f}fps",
             f"{snap.infer_ms:5.1f}ms",
@@ -477,6 +535,11 @@ class Console:
             f"tracks {len(self.tracker.states):2d}",
             live,
         ]
+        if st.get("device"):
+            bits.append(st["device"])
+        gpu = self.gpu.text(now)
+        if gpu:
+            bits.append(gpu)
         if self.speech.available:
             bits.append(f"tts {getattr(self.speech, 'backend', '')}".rstrip())
         elif self.speech.error:
@@ -486,6 +549,8 @@ class Console:
         self.lbl_status.configure(text="   ".join(bits))
         if self._devices_started and st["ready"]:
             self.btn_devices.configure(text="Camera running", state="disabled")
+        elif self._devices_started and st["stage"] == "no camera":
+            self.btn_devices.configure(text="No camera", state="disabled")
 
     def _flash(self, text: str) -> None:
         self.session.message = text

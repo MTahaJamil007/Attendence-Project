@@ -20,6 +20,8 @@ GREEN = (110, 220, 130)
 RED = (110, 110, 250)
 WHITE = (255, 255, 255)
 DARK = (35, 35, 35)
+CYAN = (230, 200, 60)
+MAGENTA = (240, 80, 240)
 
 
 def score_color(score: float, enter: float, exit_: float) -> tuple[int, int, int]:
@@ -94,6 +96,8 @@ def annotate(
     track_states: dict | None = None,
     header: str | None = None,
     copy: bool = True,
+    seats=None,
+    flag=None,
 ) -> np.ndarray:
     """Draw detections, scores and status onto a frame.
 
@@ -101,6 +105,11 @@ def annotate(
         result: a FrameResult from VideoWorker.
         track_states: optional ``track_id -> TrackState`` for smoothed values.
         header: optional status line drawn across the top.
+        seats: optional SeatRecords credited this session (gating Rule D), drawn
+            as a small dot with the roll number so the teacher sees who has
+            already answered from where.
+        flag: optional gating Decision that stopped the call for the teacher; its
+            hands and the seat they collide with are drawn prominently.
     """
     out = frame.copy() if copy else frame
     enter = float(cfg.get("temporal.enter_threshold", 0.55))
@@ -128,6 +137,11 @@ def annotate(
             bits.append("RAISED")
         _label(out, " ".join(bits), (x1, max(14, y1 - 10)), color)
 
+    if seats:
+        _draw_seats(out, seats)
+    if flag is not None:
+        _draw_flag(out, flag, result, track_states)
+
     if header:
         h, w = out.shape[:2]
         cv2.rectangle(out, (0, 0), (w, 30), DARK, -1)
@@ -135,6 +149,70 @@ def annotate(
             out, header, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 1, cv2.LINE_AA
         )
     return out
+
+
+def short_roll(roll: str) -> str:
+    """The distinguishing tail of a roll number: SP25-BCS-009 -> 009."""
+    tail = roll.replace("_", "-").split("-")[-1]
+    return tail or roll[-4:]
+
+
+def _draw_seats(frame: np.ndarray, seats) -> None:
+    for rec in seats:
+        c = (int(rec.x), int(rec.y))
+        r = max(3, int(rec.scale * 0.10))
+        cv2.circle(frame, c, r, CYAN, -1, cv2.LINE_AA)
+        cv2.circle(frame, c, r, DARK, 1, cv2.LINE_AA)
+        _label(frame, short_roll(rec.roll), (c[0] + r + 2, c[1] + 5), CYAN, 0.42)
+
+
+def _current(track_states, decision_track, tid):
+    """The live state of track *tid* if still tracked, else the decision's copy."""
+    if track_states and tid in track_states:
+        return track_states[tid]
+    if decision_track is not None and decision_track.track_id == tid:
+        return decision_track
+    return None
+
+
+def _draw_flag(frame: np.ndarray, flag, result, track_states) -> None:
+    """Point at exactly what made the system stop and ask.
+
+    The magenta ring is the seat already credited this session; the magenta box
+    is the hand raised now; the line joins them. A teacher glancing at the screen
+    sees which student is raising for a second roll number without reading text.
+    """
+    seat_matches = getattr(flag, "seat_matches", None) or {}
+    tracks = {st.track_id: st for st in (getattr(flag, "competing", None) or [])}
+    own = getattr(flag, "track", None)
+    if own is not None:
+        tracks.setdefault(own.track_id, own)
+
+    for n, (tid, st0) in enumerate(sorted(tracks.items()), start=1):
+        st = _current(track_states, st0, tid) or st0
+        bbox = st.bbox or st.best_bbox
+        m = seat_matches.get(tid)
+        verdict = getattr(getattr(flag, "verdict", None), "value", "")
+        if m is not None:
+            text = f"#{tid} SAME SEAT AS {m.record.roll}"
+        elif verdict == "reused_track":
+            text = f"#{tid} ALREADY MARKED"
+        else:
+            text = f"HAND {n}  #{tid}"
+        if bbox is not None:
+            x1, y1, x2, y2 = (int(v) for v in bbox)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), MAGENTA, 4)
+            _label(frame, text, (x1, max(18, y1 - 26)), MAGENTA, 0.6)
+        if m is not None:
+            rec = m.record
+            centre = (int(rec.x), int(rec.y))
+            radius = max(10, int(rec.scale * 0.6))
+            cv2.circle(frame, centre, radius, MAGENTA, 3, cv2.LINE_AA)
+            _label(frame, f"MARKED {rec.roll}", (centre[0] - radius, centre[1] + radius + 18),
+                   MAGENTA, 0.55)
+            if st.anchor is not None:
+                cv2.line(frame, (int(st.anchor[0]), int(st.anchor[1])), centre,
+                         MAGENTA, 2, cv2.LINE_AA)
 
 
 def crop_person(

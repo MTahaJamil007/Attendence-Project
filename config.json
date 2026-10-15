@@ -1,6 +1,8 @@
 {
   "_comment": "All tunables live here. Nothing in src/ hard-codes a threshold.",
   "camera": {
+    "_comment": "source: empty = local camera (index, or -1 to auto-detect); or a phone address such as 192.168.43.1, 192.168.43.1:4747 or a full http:// or rtsp:// URL. rotate: 0/90/180/270 for a phone mounted in portrait.",
+    "source": "",
     "index": -1,
     "scan_max_index": 7,
     "width": 1920,
@@ -8,7 +10,9 @@
     "fps_request": 30,
     "buffer_size": 1,
     "flip_horizontal": false,
-    "fourcc": "MJPG"
+    "fourcc": "MJPG",
+    "rotate": 0,
+    "network_timeout_sec": 3.0
   },
   "model": {
     "weights": "yolo11m-pose.pt",
@@ -77,13 +81,20 @@
     "track_grace_sec": 0.5,
     "track_expire_sec": 2.0,
     "require_fresh_raise": true,
-    "fresh_lookback_sec": 1.5
+    "fresh_lookback_sec": 1.5,
+    "anchor_tau_sec": 0.4
   },
   "gating": {
     "require_single_hand": true,
     "one_credit_per_track": true,
     "seat_zone_lock": false,
-    "seat_zone_tolerance_torso": 3.0
+    "seat_zone_tolerance_torso": 3.0,
+    "_comment": "seat_memory (Rule D): a raised hand at a seat that already answered for another roll this session is flagged for the teacher, even if the tracker ID changed. Distances are in shoulder widths: neighbours sit about 1.0 apart, so both radii must stay below that.",
+    "seat_memory": true,
+    "seat_radius_shoulders": 0.5,
+    "seat_appearance_radius_shoulders": 0.8,
+    "seat_appearance_min_similarity": 0.85,
+    "seat_scale_ratio_max": 1.6
   },
   "session": {
     "reaction_delay_sec": 0.45,

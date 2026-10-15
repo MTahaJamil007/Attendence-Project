@@ -5,3 +5,5 @@ evidence/
 *.pt
 *.engine
 data/seatmap.json
+data/last_camera.json
+platform-tools/

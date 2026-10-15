@@ -56,6 +56,9 @@ def main() -> int:
         print("  WARNING: no GPU. Frame rate will be too low for a real session.")
 
     worker = VideoWorker(cfg, runtime_report=rep)
+    if len(sys.argv) > 1:
+        # run.bat preview 192.168.43.1:8080 - preview a phone camera
+        worker.set_source(sys.argv[1])
     tracker = TemporalRaiseTracker(cfg)
     gate = AttendanceGate(cfg)
 

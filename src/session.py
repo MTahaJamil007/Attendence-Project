@@ -13,8 +13,9 @@ Three behaviours here exist specifically because the predecessor lacked them:
   inference freezes, ruining three of its eight recorded runs.
 
 * **Ambiguity is escalated, never guessed.** Two raised hands, or a hand belonging
-  to someone already marked, stops the machine and asks the teacher. Rule A only
-  means something if the system actually refuses to decide.
+  to someone already marked - by tracker ID or by seat - stops the machine and
+  asks the teacher, with the seat in question drawn on the operator view. Rule A
+  only means something if the system actually refuses to decide.
 
 * **Speech is advisory.** The window opens when the utterance completes *or* when
   a timeout expires, whichever comes first. A hung SAPI engine cannot freeze the
@@ -65,6 +66,8 @@ class SessionView:
     stats: dict = field(default_factory=dict)
     blocked_reason: str = ""
     needs_teacher: bool = False
+    # Why the machine stopped for the teacher (a gating Verdict value), if it did.
+    flag: str = ""
 
     @property
     def window_fraction(self) -> float:
@@ -109,6 +112,9 @@ class Session:
         self.message: str = ""
         self.result_text: str = ""
         self.blocked_reason: str = ""
+        # The gating decision that stopped the current call for the teacher. The
+        # console draws its seats and hands; telemetry records it with the mark.
+        self.flag = None
         self.last_marked: int = -1
         # One record per decision, exported as session_*.json. Without this the
         # CSV cannot answer questions like "was the same tracked person credited
@@ -122,6 +128,7 @@ class Session:
         self.current = -1
         self.phase = Phase.IDLE
         self.last_marked = -1
+        self.flag = None
         self.telemetry.clear()
         self.message = f"{len(students)} students loaded"
         self.tracker.reset()
@@ -138,6 +145,7 @@ class Session:
         self.current = -1
         self.last_marked = -1
         self.phase = Phase.IDLE
+        self.flag = None
         self.telemetry.clear()
         self.tracker.reset()
         self.gate.reset_session()
@@ -218,6 +226,7 @@ class Session:
         self.phase = Phase.CALLING
         self.result_text = ""
         self.blocked_reason = ""
+        self.flag = None
         self._extended = False
         self._speech_done_at = None
         self._call_started = now
@@ -284,11 +293,14 @@ class Session:
             return
         if decision.needs_teacher:
             self.phase = Phase.AMBIGUOUS
+            self.flag = decision
             self.message = decision.message
             self.blocked_reason = decision.message
-            self.result_text = (
-                "TWO HANDS" if decision.verdict is Verdict.AMBIGUOUS else "CHECK"
-            )
+            self.result_text = {
+                Verdict.AMBIGUOUS: "TWO HANDS",
+                Verdict.REUSED_SEAT: "SAME SEAT",
+                Verdict.REUSED_TRACK: "ALREADY MARKED",
+            }.get(decision.verdict, "CHECK")
             return
 
         # 3. Deadline.
@@ -313,7 +325,7 @@ class Session:
         if track is not None:
             st.track_id = track.track_id
             st.score = round(track.peak_ema, 3)
-            self.gate.commit(st.roll, track)
+            self.gate.commit(st.roll, track, now)
             if self.evidence is not None:
                 try:
                     st.evidence_image = self.evidence.capture(st, track, self.video)
@@ -346,7 +358,39 @@ class Session:
             "fps": round(vstat.get("fps") or 0.0, 1),
             "capture_fps": round(vstat.get("capture_fps") or 0.0, 1),
             "evidence_image": st.evidence_image,
+            "seat": self._seat_summary(st.roll),
+            "flag": self._flag_summary(),
         })
+        self.flag = None
+
+    def _seat_summary(self, roll: str) -> dict | None:
+        rec = getattr(self.gate, "seats", {}).get(roll)
+        if rec is None:
+            return None
+        return {"x": round(rec.x, 1), "y": round(rec.y, 1), "scale": round(rec.scale, 1)}
+
+    def _flag_summary(self) -> dict | None:
+        """What stopped this call for the teacher, kept with the teacher's answer.
+
+        Lets an audit separate "the system flagged it and the teacher overrode"
+        from "the system was sure", which the CSV's evidence column cannot.
+        """
+        d = self.flag
+        if d is None:
+            return None
+        out = {"verdict": d.verdict.value, "message": d.message}
+        seats = getattr(d, "seat_matches", None) or {}
+        if seats:
+            out["seat_matches"] = [
+                {
+                    "track_id": m.track_id,
+                    "seat_of": m.record.roll,
+                    "distance_shoulders": round(m.distance, 3),
+                    "appearance": None if m.appearance is None else round(m.appearance, 3),
+                }
+                for m in seats.values()
+            ]
+        return out
 
     def mark_manual(self, present: bool, now: float) -> None:
         """Teacher override, also used to resolve an AMBIGUOUS call."""
@@ -358,8 +402,13 @@ class Session:
         if present:
             # Credit the strongest confirmed track so Rule B still consumes it -
             # otherwise a manually confirmed student leaves their track free to
-            # answer for somebody else.
+            # answer for somebody else. When the call was stopped over one
+            # specific hand (a reused seat or track), that is the hand the
+            # teacher just looked at and confirmed.
             confirmed = self.tracker.confirmed()
+            flagged = getattr(self.flag, "track", None)
+            if flagged is not None and flagged.track_id in self.tracker.states:
+                confirmed = [self.tracker.states[flagged.track_id]]
             if confirmed:
                 best = max(confirmed, key=lambda s: s.peak_ema)
 
@@ -423,6 +472,8 @@ class Session:
         v.result = self.result_text
         v.blocked_reason = self.blocked_reason
         v.needs_teacher = self.phase is Phase.AMBIGUOUS
+        if self.flag is not None:
+            v.flag = self.flag.verdict.value
 
         if 0 <= self.current < len(self.students):
             st = self.students[self.current]
@@ -461,6 +512,8 @@ class Session:
                 return "RAISE HIGHER"
             return "RAISE YOUR HAND"
         if self.phase is Phase.AMBIGUOUS:
+            if v.flag in (Verdict.REUSED_SEAT.value, Verdict.REUSED_TRACK.value):
+                return "ALREADY MARKED - TEACHER WILL CHECK"
             return "TOO MANY HANDS - WAIT"
         if self.phase is Phase.RESULT:
             return "PRESENT" if v.result == PRESENT.upper() else "ABSENT"

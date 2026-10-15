@@ -87,6 +87,12 @@ class StubVideo:
     def request_next_camera(self):
         self.switched += 1
 
+    def request_source(self, source):
+        self.requested = source
+
+    def set_source(self, source):
+        self.source = source
+
 
 class StubSpeech:
     available = True
@@ -254,8 +260,89 @@ def test_console_builds_and_ticks() -> None:
         pass
 
 
+def test_phone_dialog_and_seat_flag() -> None:
+    section("phone camera dialog, GPU status, and a seat flag on the video")
+    import time as _time
+
+    from gating import Verdict
+    from ui import console as console_mod
+    from ui.console import Console
+
+    # Keep the test from touching the real "last phone" file.
+    console_mod.LAST_CAMERA_FILE = ROOT / "logs" / "_test_last_camera.json"
+
+    root = tk.Tk()
+    root.withdraw()
+    video = StubVideo()
+    tracker = TemporalRaiseTracker(CFG)
+    gate = AttendanceGate(CFG)
+    session = Session(CFG, video, tracker, gate, StubSpeech())
+    session.set_students(make_students())
+    con = Console(root, CFG, video, tracker, gate, StubSpeech(), session)
+    root.update()
+
+    names = []
+
+    def walk(w):
+        for c in w.winfo_children():
+            try:
+                names.append(str(c.cget("text")))
+            except Exception:
+                pass
+            walk(c)
+
+    walk(root)
+    check("Phone Camera" in names, "toolbar has a Phone Camera button")
+
+    con.phone_camera()
+    root.update()
+    dlg = con._phone_dialog
+    check(dlg is not None and dlg.win.winfo_exists(), "dialog opens")
+    dlg.addr.set("192.168.43.1:8080")
+    dlg.connect()
+    check(getattr(video, "source", None) == "192.168.43.1:8080" and video.started,
+          "Connect before Start Camera: sets the source and starts the pipeline",
+          str(getattr(video, "source", None)))
+    check(con._last_phone() == "192.168.43.1:8080", "the address is remembered for next time")
+    con._connect_phone("10.0.0.7")
+    check(getattr(video, "requested", None) == "10.0.0.7",
+          "Connect while running: switches source live", str(getattr(video, "requested", None)))
+    dlg.close()
+
+    # A REUSED_SEAT flag rendered on the operator video, without a UI error.
+    from raise_detector import TrackState
+
+    def seated(tid):
+        st = TrackState(track_id=tid, ema=0.9, latched=True, latched_at=0.0,
+                        confirmed=True, peak_ema=0.9)
+        st.bbox = st.best_bbox = (280.0, 150.0, 360.0, 420.0)
+        st.anchor = (320.0, 250.0, 60.0)
+        return st
+
+    gate.commit(session.students[0].roll, seated(1), now=1.0)
+    session.current = 3
+    session.phase = Phase.AMBIGUOUS
+    session.flag = gate.evaluate([seated(9)], session.students[3].roll)
+    tracker.states[9] = seated(9)
+    for _ in range(3):
+        con._tick()
+        root.update()
+    status = con.lbl_status.cget("text")
+    check("UI error" not in status, "renders the seat flag without error", status[:90])
+    check(session.flag is not None and session.flag.verdict is Verdict.REUSED_SEAT,
+          "session holds the flag for the overlay")
+    if con.gpu.available:
+        check("gpu" in status, "status bar shows live GPU load (NVML)", status[-40:])
+    con.close()
+    try:
+        console_mod.LAST_CAMERA_FILE.unlink()
+    except Exception:
+        pass
+
+
 def main() -> int:
-    for fn in (test_roll_display_all_phases, test_console_builds_and_ticks):
+    for fn in (test_roll_display_all_phases, test_console_builds_and_ticks,
+               test_phone_dialog_and_seat_flag):
         try:
             fn()
         except Exception as exc:

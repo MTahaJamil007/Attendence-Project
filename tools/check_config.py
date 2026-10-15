@@ -312,6 +312,35 @@ def main() -> int:
         ("imgsz is a multiple of 32", int(cfg.require("model.imgsz")) % 32 == 0,
          str(cfg.require("model.imgsz")))
     )
+    g = cfg.section("gating")
+    checks.append(
+        # Two people side by side have shoulder midpoints about one shoulder
+        # width apart. A radius reaching that far would call a neighbour "the
+        # same seat" and flag every student sitting beside someone already marked.
+        ("0 < seat_radius_shoulders <= seat_appearance_radius_shoulders < 1.0",
+         0.0 < g["seat_radius_shoulders"] <= g["seat_appearance_radius_shoulders"] < 1.0,
+         f"{g['seat_radius_shoulders']} <= {g['seat_appearance_radius_shoulders']}")
+    )
+    checks.append(
+        ("0.5 <= seat_appearance_min_similarity < 1.0",
+         0.5 <= g["seat_appearance_min_similarity"] < 1.0,
+         f"{g['seat_appearance_min_similarity']}")
+    )
+    checks.append(
+        ("seat_scale_ratio_max > 1.0", g["seat_scale_ratio_max"] > 1.0,
+         f"{g['seat_scale_ratio_max']}")
+    )
+    cam = cfg.section("camera")
+    checks.append(
+        ("camera.rotate is 0 / 90 / 180 / 270", int(cam.get("rotate", 0)) in (0, 90, 180, 270),
+         f"{cam.get('rotate')}")
+    )
+    checks.append(
+        # Longer than this and a dead phone link holds the capture thread long
+        # past the stall limit before the reconnect even starts.
+        ("0.5 <= camera.network_timeout_sec <= 10", 0.5 <= float(cam.get("network_timeout_sec", 3.0)) <= 10.0,
+         f"{cam.get('network_timeout_sec')}")
+    )
 
     for name, ok, detail in checks:
         tag = "OK  " if ok else "FAIL"

@@ -27,9 +27,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
 
-from camera import CameraInfo, discover_cameras, open_camera
+from appearance import torso_signature
+from camera import CameraInfo, discover_cameras, open_source
+from netcam import is_network_source
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from liveness import LivenessMonitor
@@ -90,6 +93,18 @@ class VideoWorker:
         self.quantize: int | None = 16 if self.half else None
 
         self.flip: bool = bool(cfg.get("camera.flip_horizontal", False))
+        rot = int(cfg.get("camera.rotate", 0) or 0) % 360
+        # A phone may be mounted in portrait; turn its picture upright before
+        # inference, which expects people the right way up.
+        self.rotate_code = {
+            90: cv2.ROTATE_90_CLOCKWISE,
+            180: cv2.ROTATE_180,
+            270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+        }.get(rot)
+        # Camera to use: a local index, or a phone address / URL. Empty means
+        # camera.index, then automatic discovery of local cameras.
+        self.source: str = str(cfg.get("camera.source", "") or "").strip()
+        self.kp_conf: float = float(mcfg["keypoint_conf"])
         self.scorer = RaiseScorer(cfg)
 
         # --- published state (guarded by _lock) ---------------------------
@@ -102,6 +117,10 @@ class VideoWorker:
         self.error: str | None = None
         self.ready: bool = False
         self.model_name: str = ""
+        # Where inference really runs, read back from the predictor after the
+        # warm-up rather than assumed from the config.
+        self.infer_device: str = ""
+        self._model_loaded: bool = False
 
         self.last_frame_at: float = 0.0
         self.last_infer_at: float = 0.0
@@ -111,7 +130,7 @@ class VideoWorker:
 
         self.cameras: list[CameraInfo] = []
         self.active: CameraInfo | None = None
-        self._switch_to: int | None = None
+        self._switch_to: int | str | None = None
         self._switch_next: bool = False
 
         self._stop = threading.Event()
@@ -186,8 +205,29 @@ class VideoWorker:
         return self.infer_liveness.may_record_absence(now)
 
     # -- camera switching --------------------------------------------------
+    def set_source(self, source: int | str | None) -> None:
+        """Choose the camera before start(): an index or a phone address/URL.
+
+        None, "" or "usb" mean the local camera (camera.index, else discovery).
+        """
+        text = "" if source is None else str(source).strip()
+        self.source = "" if text.lower() in ("usb", "auto") else text
+
     def request_camera(self, index: int) -> None:
         self._switch_to = index
+
+    def request_source(self, source: int | str) -> None:
+        """Switch to a local index or a phone address while running.
+
+        Before start() this only records the choice. While running, the switch is
+        done on the inference thread, and the current camera keeps running until
+        the new one has actually delivered a frame - a mistyped phone address
+        must not leave the class with no camera at all.
+        """
+        if self._inf_thread is None:
+            self.set_source(source)
+            return
+        self._switch_to = source
 
     def request_next_camera(self) -> None:
         self._switch_next = True
@@ -207,7 +247,9 @@ class VideoWorker:
             "infer_ms": self.infer_ms,
             "model": self.model_name,
             "half": self.half,
+            "device": self.infer_device,
             "camera": self.active.label() if self.active else "none",
+            "camera_source": self.active.source if self.active else "",
             "cameras": [c.label() for c in self.cameras],
             "live": self.is_live(),
             "stall_age": self.stall_age(),
@@ -217,13 +259,27 @@ class VideoWorker:
         self.stage = stage
 
     # -- capture thread ----------------------------------------------------
-    def _capture_loop(self, cap, cap_stop: threading.Event) -> None:
+    def _capture_loop(self, cap, cap_stop: threading.Event, network: bool = False) -> None:
         """Decode frames into a single overwritable slot."""
         misses = 0
+        down_since = 0.0
         while not (self._stop.is_set() or cap_stop.is_set()):
             ok, frame = cap.read()
             if not ok or frame is None or frame.size == 0:
                 misses += 1
+                if network:
+                    # A phone on weak Wi-Fi drops out and comes back. Never give
+                    # up on it: the stream reconnects itself inside read(), and
+                    # meanwhile no inference results arrive, so the session sees
+                    # a stall and suspends marking instead of recording absences.
+                    # A stream read only fails when the link is actually down
+                    # (a slow phone just makes read() wait), so say so at once.
+                    if down_since == 0.0:
+                        down_since = time.monotonic()
+                    why = getattr(cap, "last_error", "") or "no frames"
+                    self.error = f"phone camera not responding ({why}) - reconnecting"
+                    self._set_stage("phone reconnecting")
+                    continue
                 # Tolerate brief hiccups; give up only on a sustained failure so
                 # the inference loop can surface a real camera fault.
                 if misses > 60:
@@ -233,6 +289,13 @@ class VideoWorker:
                 time.sleep(0.005)
                 continue
             misses = 0
+            if down_since:
+                down_since = 0.0
+                if self.stage == "phone reconnecting":
+                    self.error = None
+                    self._set_stage("running" if self._model_loaded else self.stage)
+            if self.rotate_code is not None:
+                frame = cv2.rotate(frame, self.rotate_code)
             if self.flip:
                 frame = frame[:, ::-1].copy()
             now = time.monotonic()
@@ -265,20 +328,30 @@ class VideoWorker:
             # _load_model only holds its clocks for a moment - doing the slow scan
             # afterwards would let them fall back to idle before the first real
             # frame, wasting the warm-up entirely.
-            if not self._attach_camera():
-                return
+            attached = self._attach_camera()
+            no_camera_error = self.error
             model = self._load_model()
             if model is None:
                 return
-
-            self.ready = True
-            self._set_stage("running")
+            self._model_loaded = True
+            if attached:
+                self.ready = True
+                self._set_stage("running")
+            else:
+                # Keep the loaded model and wait for a camera - typically the
+                # teacher connecting a phone - instead of ending the pipeline and
+                # forcing a restart of the whole application.
+                self.error = no_camera_error
+                self._set_stage("no camera")
             fps_ema = 0.0
             last_at = 0.0
             consecutive_failures = 0
 
             while not self._stop.is_set():
                 if self._handle_switch_request():
+                    continue
+                if self._cap is None:
+                    time.sleep(0.05)
                     continue
 
                 frame, at = self._take_frame()
@@ -359,22 +432,40 @@ class VideoWorker:
             # roughly half speed, and without this loop that penalty would land
             # squarely on the first student called.
             self._set_stage("warming up GPU")
-            dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+            # Warm up on the camera's real frame shape, through the same track()
+            # call the live loop makes. Measured: warming with predict() on a
+            # square dummy left the first real 16:9 frame taking 2.06 s - tracker
+            # set-up plus kernels for the letterboxed input shape - so the
+            # pipeline reported ready and then stalled for two seconds.
+            if self.active is not None and self.active.width and self.active.height:
+                h, w = self.active.height, self.active.width
+                if self.rotate_code in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
+                    h, w = w, h
+            else:
+                h = w = self.imgsz
+            dummy = np.zeros((h, w, 3), dtype=np.uint8)
             kw = dict(
+                persist=True,
+                tracker=self.tracker,
                 imgsz=self.imgsz,
                 device=self.device,
                 quantize=self.quantize,
                 conf=self.person_conf,
+                max_det=self.max_det,
+                classes=[0],
                 verbose=False,
             )
             deadline = time.monotonic() + self.warmup_sec
             iters = 0
             while True:
-                model.predict(dummy, **kw)
+                # An empty frame has no detections, so no tracks are created.
+                model.track(dummy, **kw)
                 iters += 1
                 if time.monotonic() >= deadline or self._stop.is_set():
                     break
             self.warmup_iters = iters
+            predictor = getattr(model, "predictor", None)
+            self.infer_device = str(getattr(predictor, "device", "") or self.device)
             return model
         except Exception as exc:
             self.error = f"cannot load model {self.weights}: {exc}"
@@ -382,16 +473,30 @@ class VideoWorker:
             return None
 
     def _attach_camera(self) -> bool:
+        if self.source:
+            self._set_stage(
+                "connecting to phone" if is_network_source(self.source) else "opening camera"
+            )
+            cap, info, err = open_source(self.source, self.cfg)
+            if cap is not None and info is not None:
+                if not info.is_network:
+                    self.cameras = [info]
+                self._begin_capture(cap, info)
+                return True
+            self.error = err
+            self._set_stage("no camera")
+            return False
+
         self._set_stage("scanning cameras")
         want = int(self.cfg.get("camera.index", -1))
 
         if want >= 0:
-            cap, info = open_camera(want, self.cfg)
+            cap, info, err = open_source(want, self.cfg)
             if cap is not None and info is not None:
                 self.cameras = [info]
                 self._begin_capture(cap, info)
                 return True
-            self.error = f"camera {want} could not be opened"
+            self.error = err
             self._set_stage("no camera")
             return False
 
@@ -405,6 +510,8 @@ class VideoWorker:
             return False
 
         info = self.cameras[0]
+        from camera import open_camera
+
         cap, opened = open_camera(info.index, self.cfg, info.backend)
         if cap is None or opened is None:
             self.error = f"camera {info.index} was detected but could not be reopened"
@@ -416,56 +523,102 @@ class VideoWorker:
     def _begin_capture(self, cap, info: CameraInfo) -> None:
         self._cap = cap
         self.active = info
+        self.source = info.source or str(info.index)
         self._cap_stop = threading.Event()
         self._cap_thread = threading.Thread(
             target=self._capture_loop,
-            args=(cap, self._cap_stop),
+            args=(cap, self._cap_stop, info.is_network),
             name="camera-capture",
             daemon=True,
         )
         self._cap_thread.start()
+        if self._model_loaded:
+            self.ready = True
+            self.error = None
+            self._set_stage("running")
 
-    def _handle_switch_request(self) -> bool:
-        target: int | None = None
-        if self._switch_to is not None:
-            target = self._switch_to
-            self._switch_to = None
-        elif self._switch_next:
-            self._switch_next = False
-            if self.cameras and self.active is not None:
-                idxs = [c.index for c in self.cameras]
-                try:
-                    pos = idxs.index(self.active.index)
-                except ValueError:
-                    pos = -1
-                target = idxs[(pos + 1) % len(idxs)]
-        if target is None:
-            return False
-        if self.active is not None and target == self.active.index:
-            return False
-
-        # Tear down the old capture thread before opening the new device; two
-        # threads reading different VideoCapture objects would both publish into
-        # the same slot. Only the capture event is signalled, so this thread
-        # (inference) keeps running.
+    def _end_capture(self) -> None:
+        """Retire the capture thread and release its device."""
         old_cap = self._cap
         self._cap_stop.set()
         if self._cap_thread is not None:
-            self._cap_thread.join(timeout=2.0)
+            self._cap_thread.join(timeout=4.0)
         self._cap_thread = None
+        self._cap = None
         if old_cap is not None:
             try:
                 old_cap.release()
             except Exception:
                 pass
 
-        cap, info = open_camera(target, self.cfg)
-        if cap is None or info is None:
-            self.error = f"could not switch to camera {target}"
+    def _handle_switch_request(self) -> bool:
+        target: int | str | None = None
+        if self._switch_to is not None:
+            target = self._switch_to
+            self._switch_to = None
+        elif self._switch_next:
+            self._switch_next = False
+            if not self.cameras or (self.active is not None and self.active.is_network):
+                # On a phone, or nothing found at start-up: "next" means back to
+                # a local camera, so look for them now.
+                self._set_stage("scanning cameras")
+                self.cameras = discover_cameras(self.cfg)
+            if self.cameras:
+                idxs = [c.index for c in self.cameras]
+                pos = -1
+                if self.active is not None and not self.active.is_network:
+                    try:
+                        pos = idxs.index(self.active.index)
+                    except ValueError:
+                        pos = -1
+                target = idxs[(pos + 1) % len(idxs)]
+            elif self.active is None:
+                self.error = "no local camera found"
+                self._set_stage("no camera")
+        if target is None:
             return False
-        self.error = None
+        if isinstance(target, str) and target.strip().lower() in ("usb", "auto"):
+            self._set_stage("scanning cameras")
+            self.cameras = discover_cameras(self.cfg)
+            if not self.cameras:
+                self.error = "no local camera found"
+                self._set_stage("running" if self._cap is not None else "no camera")
+                return False
+            target = self.cameras[0].index
+        if self.active is not None:
+            if self.active.is_network and str(target).strip() == self.active.source:
+                return False
+            if not self.active.is_network and str(target).strip() == str(self.active.index):
+                return False
+
+        prev_stage = self.stage
+        self._set_stage(
+            "connecting to phone" if is_network_source(target) else "opening camera"
+        )
+        # Open the new camera first, while the old one keeps running. Only when
+        # it has produced a frame is the old one retired - a phone that cannot be
+        # reached leaves the current camera in place, with the reason shown.
+        cap, info, err = open_source(target, self.cfg)
+        if cap is None and not is_network_source(target) and self._cap is not None:
+            # Some USB controllers cannot run two webcams at once: free the old
+            # one and try again, putting it back if the new one still fails.
+            old = self.active
+            self._end_capture()
+            cap, info, err = open_source(target, self.cfg)
+            if cap is None and old is not None:
+                back, back_info, _ = open_source(old.source or old.index, self.cfg)
+                if back is not None:
+                    self._begin_capture(back, back_info)
+        if cap is None or info is None:
+            self.error = f"could not switch camera - {err}"
+            if self._cap is not None:
+                self._set_stage(prev_stage if prev_stage != "connecting to phone" else "running")
+            else:
+                self._set_stage("no camera")
+            return False
+        if self._cap is not None:
+            self._end_capture()
         self._begin_capture(cap, info)
-        self._set_stage("running")
         return True
 
     # -- scoring one frame -------------------------------------------------
@@ -510,13 +663,21 @@ class VideoWorker:
             if height < self.min_person_h:
                 continue
             kp = [(float(a), float(b), float(c)) for a, b, c in kps[i]]
+            score = self.scorer.score(kp, height)
+            # Clothing colour for the seat check (gating Rule D). Only people with
+            # a hand at least partly up are ever compared, so only they pay for it.
+            if score.score > 0.0:
+                try:
+                    score.signature = torso_signature(frame, kp, self.kp_conf)
+                except Exception:
+                    score.signature = None
             people.append(
                 PersonObservation(
                     track_id=int(ids[i]) if ids is not None else None,
                     bbox=(x1, y1, x2, y2),
                     box_conf=float(confs[i]),
                     keypoints=kp,
-                    score=self.scorer.score(kp, height),
+                    score=score,
                 )
             )
         return people

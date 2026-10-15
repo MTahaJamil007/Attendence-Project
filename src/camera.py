@@ -23,6 +23,11 @@ os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
 
 import cv2  # noqa: E402
 
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+except Exception:
+    pass
+
 
 @dataclass
 class CameraInfo:
@@ -30,8 +35,18 @@ class CameraInfo:
     backend: str
     width: int
     height: int
+    # Empty for a local (USB / built-in) camera; the stream URL for a phone.
+    source: str = ""
+
+    @property
+    def is_network(self) -> bool:
+        return bool(self.source)
 
     def label(self) -> str:
+        if self.source:
+            from netcam import describe
+
+            return f"Phone {describe(self.source)} ({self.width}x{self.height})"
         return f"Camera {self.index} ({self.backend}, {self.width}x{self.height})"
 
 
@@ -109,6 +124,39 @@ def open_camera(
     return None, None
 
 
+def open_source(source, cfg):
+    """Open a local camera index or a phone stream address.
+
+    *source* is an int / digit string (local camera index), or anything a teacher
+    might type for a phone: ``192.168.43.1``, ``192.168.43.1:4747`` or a full
+    ``http://`` / ``rtsp://`` URL. For a bare address each known phone app's port
+    is tried in turn.
+
+    Returns ``(capture, CameraInfo, error)``; capture is None on failure.
+    """
+    from netcam import candidate_urls, is_usb_source, open_stream
+
+    if is_usb_source(source):
+        cap, info = open_camera(int(source), cfg)
+        if cap is None:
+            return None, None, f"camera {int(source)} could not be opened"
+        return cap, info, ""
+
+    timeout = float(cfg.get("camera.network_timeout_sec", 3.0))
+    urls = candidate_urls(str(source))
+    if not urls:
+        return None, None, f"{source!r} is not a camera index or a phone address"
+    last_err = ""
+    for url in urls:
+        stream, frame, err = open_stream(url, timeout=timeout)
+        if stream is not None and frame is not None:
+            h, w = frame.shape[:2]
+            backend = "HTTP" if url.lower().startswith("http") else "FFMPEG"
+            return stream, CameraInfo(index=-1, backend=backend, width=w, height=h, source=url), ""
+        last_err = f"{url}: {err}"
+    return None, None, f"phone camera not reachable - {last_err}"
+
+
 def discover_cameras(cfg, max_index: int | None = None) -> list[CameraInfo]:
     """Probe indices 0..max_index and return every camera that produced a frame."""
     if max_index is None:
@@ -135,13 +183,15 @@ def main() -> int:
     print("scanning cameras (this can take a few seconds per index)...")
     cams = discover_cameras(cfg)
     if not cams:
-        print("NO CAMERA FOUND.")
+        print("NO LOCAL CAMERA FOUND.")
         print("Close Camera / Zoom / Teams if they are holding the device, then retry.")
-        return 1
-    print(f"found {len(cams)} camera(s):")
-    for c in cams:
-        print("  " + c.label())
-    return 0
+    else:
+        print(f"found {len(cams)} local camera(s):")
+        for c in cams:
+            print("  " + c.label())
+    print()
+    print("phone cameras on Wi-Fi / hotspot / USB: run.bat phone")
+    return 0 if cams else 1
 
 
 if __name__ == "__main__":

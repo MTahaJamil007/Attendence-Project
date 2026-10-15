@@ -26,12 +26,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from appearance import blend as blend_signature
 from geometry import (
     SIDE_JOINTS,
     angle_at_deg,
     face_reference,
     forearm_from_vertical_deg,
     ramp,
+    seat_anchor,
     torso_length,
 )
 
@@ -66,6 +68,11 @@ class PersonScore:
     torso_px: float = 0.0
     left: SideScore | None = None
     right: SideScore | None = None
+    # Seat position (x, y, scale_px) from the shoulders; see geometry.seat_anchor.
+    anchor: tuple[float, float, float] | None = None
+    # Clothing-colour histogram (appearance.torso_signature), filled in by
+    # VideoWorker for people with a hand up - the only ones gating compares.
+    signature: object | None = None
 
     @property
     def best(self) -> SideScore | None:
@@ -238,6 +245,7 @@ class RaiseScorer:
         if torso <= 0.0:
             out.reason = "subject too small to judge"
             return out
+        out.anchor = seat_anchor(kp, torso, self.kp_conf)
 
         out.left = self._score_side(kp, "left", torso)
         out.right = self._score_side(kp, "right", torso)
@@ -271,6 +279,13 @@ class TrackState:
     bbox: tuple[float, float, float, float] | None = None
     best_bbox: tuple[float, float, float, float] | None = None
 
+    # Smoothed seat position and colour signature: what gating compares against
+    # the seats already credited this session, so a person whose tracker ID
+    # changed is still recognised as sitting where someone was already marked.
+    anchor: tuple[float, float, float] | None = None
+    signature: object | None = None
+    last_seen_anchor: float = 0.0
+
     def held_for(self, now: float) -> float:
         if not self.latched or self.latched_at is None:
             return 0.0
@@ -297,6 +312,7 @@ class TemporalRaiseTracker:
         self.expire: float = float(t["track_expire_sec"])
         self.require_fresh: bool = bool(t.get("require_fresh_raise", True))
         self.fresh_lookback: float = float(t.get("fresh_lookback_sec", 1.5))
+        self.anchor_tau: float = float(t.get("anchor_tau_sec", 0.4))
 
         self.states: dict[int, TrackState] = {}
         self._armed_at: float = 0.0
@@ -387,6 +403,7 @@ class TemporalRaiseTracker:
             st.last_seen = now
             st.last_score = ps
             st.bbox = bbox
+            self._update_seat(st, ps, now)
             if st.ema > st.peak_ema:
                 st.peak_ema = st.ema
                 st.best_score = ps
@@ -429,6 +446,19 @@ class TemporalRaiseTracker:
             del self.states[tid]
 
         return [st for st in self.states.values() if st.confirmed]
+
+    def _update_seat(self, st: TrackState, ps: PersonScore, now: float) -> None:
+        """Smooth the seat anchor over time; keypoints jitter by a few pixels."""
+        if ps.anchor is not None:
+            if st.anchor is None:
+                st.anchor = ps.anchor
+            else:
+                a = 1.0 if self.anchor_tau <= 1e-6 else 1.0 - math.exp(
+                    -max(0.0, now - st.last_seen_anchor) / self.anchor_tau)
+                st.anchor = tuple(o + a * (n - o) for o, n in zip(st.anchor, ps.anchor))
+            st.last_seen_anchor = now
+        if ps.signature is not None:
+            st.signature = blend_signature(st.signature, ps.signature)
 
     # -- queries -----------------------------------------------------------
     def confirmed(self) -> list[TrackState]:

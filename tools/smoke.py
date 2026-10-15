@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--startup-timeout", type=float, default=180.0)
+    ap.add_argument("--camera", default=None,
+                    help="local camera index or phone address, e.g. 192.168.43.1:8080")
     args = ap.parse_args(argv)
 
     cfg = Config.load(ROOT / "config.json")
@@ -48,6 +50,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     worker = VideoWorker(cfg, runtime_report=rep)
+    if args.camera:
+        worker.set_source(args.camera)
     tracker = TemporalRaiseTracker(cfg)
     gate = AttendanceGate(cfg)
 
@@ -77,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     st = worker.status()
     print(f"    camera : {st['camera']}")
     print(f"    fp16   : {worker.half} (quantize={worker.quantize})")
+    print(f"    device : {worker.infer_device}")
     print(f"    tracker: {worker.tracker}")
     print()
     print(f"  sampling for {args.seconds:.0f}s ...")

@@ -196,3 +196,40 @@ def torso_length(
     # 3. detection-box proxy
     span = bbox_height * 0.30
     return span if span >= min_torso_px else 0.0
+
+
+def seat_anchor(
+    kp: list[tuple[float, float, float]],
+    torso_px: float,
+    keypoint_conf: float,
+) -> tuple[float, float, float] | None:
+    """Where a person sits, as ``(x, y, scale_px)``, independent of their arms.
+
+    Used to recognise the same seat across calls when the tracker's ID has
+    changed. The bounding-box centre is useless for that: raising a hand grows
+    the box upward by up to half its height, so the same student's box centre
+    moves by more than the distance to their neighbour. The shoulder midpoint
+    barely moves when an arm goes up.
+
+    *scale_px* is the unit seat distances are measured in: the larger of the
+    shoulder width and ``torso / 1.5``. Shoulder width is the natural seat unit -
+    two people side by side cannot have shoulder midpoints much closer than one
+    shoulder width without overlapping - and the torso term keeps the unit from
+    collapsing when a student turns sideways and their shoulders foreshorten.
+
+    Returns None when no shoulder is visible.
+    """
+    ls, rs = kp[LEFT_SHOULDER], kp[RIGHT_SHOULDER]
+    l_ok, r_ok = ls[2] >= keypoint_conf, rs[2] >= keypoint_conf
+    torso_unit = torso_px / 1.5 if torso_px > 0 else 0.0
+    if l_ok and r_ok:
+        width = dist(ls[0], ls[1], rs[0], rs[1])
+        return (ls[0] + rs[0]) * 0.5, (ls[1] + rs[1]) * 0.5, max(width, torso_unit)
+    if not (l_ok or r_ok) or torso_unit <= 0.0:
+        return None
+    sx, sy, _ = ls if l_ok else rs
+    # One shoulder: centre it under the face when the face is visible, since the
+    # face sits on the body's midline.
+    fx, _fy, _src = face_reference(kp, keypoint_conf)
+    x = fx if fx is not None else sx
+    return x, sy, torso_unit
