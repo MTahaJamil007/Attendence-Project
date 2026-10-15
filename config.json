@@ -25,10 +25,10 @@
     "warmup_sec": 3.0
   },
   "raise": {
-    "_comment": "Graded score in [0,1]. Ramps are (value_at_0, value_at_1), normalized by torso length.",
+    "_comment": "Graded score in [0,1]. Ramps are (value_at_0, value_at_1), normalized by torso length. A hand near the face must reach nose height; a hand held clear of the face (beside the head) counts from about chin height - beside_head_allowance sets how much lower.",
     "ramps": {
       "wrist_lift": [
-        0.05,
+        0.1,
         0.45
       ],
       "wrist_above_elbow": [
@@ -36,28 +36,37 @@
         0.15
       ],
       "vertical_extension": [
-        -0.15,
-        0.25
+        -0.1,
+        0.05
       ],
       "elbow_lift": [
-        -0.35,
-        0.0
+        -0.8,
+        -0.3
       ],
       "arm_straightness": [
         50.0,
         110.0
+      ],
+      "forearm_vertical": [
+        45.0,
+        20.0
+      ],
+      "face_clearance": [
+        0.12,
+        0.25
       ]
     },
     "weights": {
-      "wrist_lift": 0.36,
-      "wrist_above_elbow": 0.18,
-      "vertical_extension": 0.33,
-      "elbow_lift": 0.13
+      "wrist_lift": 0.25,
+      "wrist_above_elbow": 0.1,
+      "vertical_extension": 0.55,
+      "elbow_lift": 0.1
     },
     "lateral_penalty_start": 0.9,
     "lateral_penalty_end": 1.6,
     "min_torso_px": 24.0,
-    "straightness_floor": 0.3
+    "straightness_floor": 0.3,
+    "beside_head_allowance": 0.3
   },
   "temporal": {
     "_comment": "tau is a time constant in seconds, so filter behaviour is identical at any FPS.",
@@ -83,12 +92,14 @@
     "extend_if_score_above": 0.3,
     "result_hold_sec": 0.8,
     "stall_threshold_sec": 0.75,
-    "max_speech_wait_sec": 4.0
+    "max_speech_wait_sec": 8.0
   },
   "speech": {
+    "_comment": "mode: full = whole registration number (S P two five, B C S, zero zero seven); short_unique = shortest unambiguous form (seven). engine: auto | sapi | pyttsx3.",
     "enabled": true,
-    "rate": 155,
-    "mode": "short_unique",
+    "engine": "auto",
+    "mode": "full",
+    "rate": 175,
     "volume": 1.0,
     "voice": "",
     "startup_announcement": "Attendance ready"

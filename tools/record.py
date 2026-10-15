@@ -59,7 +59,10 @@ PROTOCOL: list[tuple[str, str, bool]] = [
     ("idle", "SIT NORMALLY", False),
     ("raise_high", "RAISE YOUR HAND HIGH AND STRAIGHT", True),
     ("idle", "PUT YOUR HAND DOWN", False),
-    ("raise_low", "RAISE YOUR HAND JUST ABOVE YOUR SHOULDER", True),
+    # The slight raise the detector now accepts: elbow left down, hand up beside
+    # the head, from about chin height. The same height in front of the face is
+    # the phone/lean distractors above, so this is what the sweep must separate.
+    ("raise_low", "SLIGHT RAISE: HAND UP BESIDE YOUR HEAD, ELBOW DOWN", True),
     ("idle", "SIT NORMALLY", False),
 ]
 

@@ -106,6 +106,46 @@ def angle_at_deg(
     return math.degrees(math.acos(cos_t))
 
 
+def forearm_from_vertical_deg(ex: float, ey: float, wx: float, wy: float) -> float:
+    """Angle in degrees between the elbow->wrist vector and straight up.
+
+    0 is a forearm pointing at the ceiling, 90 is horizontal, 180 points at the
+    floor. Unlike the elbow's interior angle this does not care where the elbow
+    is, which is what lets a relaxed raise - elbow down by the ribs, forearm up -
+    be told apart from a head-scratch, whose forearm slants in toward the head.
+    Returns 180.0 for a degenerate forearm so it can never read as "up".
+    """
+    dx, dy = wx - ex, wy - ey
+    n = math.hypot(dx, dy)
+    if n < 1e-6:
+        return 180.0
+    cos_t = max(-1.0, min(1.0, -dy / n))  # "up" is -y in image coordinates
+    return math.degrees(math.acos(cos_t))
+
+
+def face_reference(
+    kp: list[tuple[float, float, float]], keypoint_conf: float
+) -> tuple[float | None, float | None, str]:
+    """Position of the face, from the best keypoints that are visible.
+
+    The nose is preferred. When it is missing the eyes, then the ears, stand in:
+    all three sit within a few pixels of each other vertically, so a hand held
+    above any of them is above face height, and a pair of them is centred on the
+    face horizontally. These are real keypoints, not a proxy invented from the
+    shoulders - when none of the face is visible the caller gets ``None`` and
+    must drop the feature rather than guess.
+
+    Returns ``(x, y, source)`` where *source* names the keypoint group used.
+    """
+    for name, idxs in (("nose", (NOSE,)), ("eyes", (LEFT_EYE, RIGHT_EYE)),
+                       ("ears", (LEFT_EAR, RIGHT_EAR))):
+        pts = [kp[i] for i in idxs if kp[i][2] >= keypoint_conf]
+        if pts:
+            n = len(pts)
+            return sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n, name
+    return None, None, ""
+
+
 def torso_length(
     kp: list[tuple[float, float, float]],
     bbox_height: float,

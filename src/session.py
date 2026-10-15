@@ -31,7 +31,7 @@ from datetime import datetime
 from enum import Enum
 
 from gating import Verdict
-from roster import ABSENT, PENDING, PRESENT, Student, summarize
+from roster import ABSENT, PENDING, PRESENT, Student, assign_calls, summarize
 
 
 class Phase(str, Enum):
@@ -88,8 +88,9 @@ class Session:
         self.extension_sec = float(s["window_extension_sec"])
         self.extend_above = float(s["extend_if_score_above"])
         self.result_hold = float(s["result_hold_sec"])
-        self.max_speech_wait = float(s.get("max_speech_wait_sec", 4.0))
+        self.max_speech_wait = float(s.get("max_speech_wait_sec", 8.0))
         self.hold_sec = float(cfg.get("temporal.hold_sec", 0.6))
+        self.call_mode = str(cfg.get("speech.mode", "full"))
 
         self.students: list[Student] = []
         self.phase: Phase = Phase.IDLE
@@ -103,6 +104,7 @@ class Session:
         self._extended: bool = False
         self._last_tick: float = 0.0
         self._resume_phase: Phase | None = None
+        self._paused_at: float = 0.0
 
         self.message: str = ""
         self.result_text: str = ""
@@ -115,6 +117,7 @@ class Session:
 
     # -- roster ------------------------------------------------------------
     def set_students(self, students: list[Student]) -> None:
+        assign_calls(students, self.call_mode)
         self.students = students
         self.current = -1
         self.phase = Phase.IDLE
@@ -146,9 +149,7 @@ class Session:
             self.message = "load or paste roll numbers first"
             return False
         if self.phase is Phase.PAUSED:
-            self.phase = self._resume_phase or Phase.RESPONSE
-            self._resume_phase = None
-            self.message = "resumed"
+            self._resume(now)
             return True
         nxt = self._next_pending()
         if nxt is None:
@@ -159,13 +160,35 @@ class Session:
         self._begin_call(nxt, now)
         return True
 
-    def pause(self) -> None:
+    def pause(self, now: float | None = None) -> None:
         if self.phase in (Phase.IDLE, Phase.FINISHED, Phase.PAUSED):
             return
         self._resume_phase = self.phase
+        self._paused_at = self._last_tick if now is None else now
         self.phase = Phase.PAUSED
         self.speech.clear()
         self.message = "paused"
+
+    def _resume(self, now: float) -> None:
+        """Continue exactly where the pause left off.
+
+        The clock does not run while paused. Before this, deadlines were absolute,
+        so pausing mid-window for longer than the time left marked the student
+        Absent the instant the teacher resumed.
+        """
+        resume = self._resume_phase or Phase.RESPONSE
+        self._resume_phase = None
+        paused_for = max(0.0, now - self._paused_at)
+        self._last_tick = now
+        if resume is Phase.CALLING:
+            # Pausing cut the utterance off, so read the number again in full.
+            self._begin_call(self.current, now)
+            self.message = "resumed"
+            return
+        self._response_ends += paused_for
+        self._result_until += paused_for
+        self.phase = resume
+        self.message = "resumed"
 
     def stop(self) -> None:
         self.phase = Phase.IDLE
@@ -222,7 +245,11 @@ class Session:
             self._open_response(now)
 
     def _open_response(self, now: float) -> None:
-        self.tracker.arm(now)
+        # Freshness counts from when the number was first shown and spoken, not
+        # from now: reading a full registration number takes 4-5 s, and a student
+        # who raised as soon as they recognised it must not be treated as a hand
+        # left over from the previous call.
+        self.tracker.arm(now, since=self._call_started)
         self.phase = Phase.RESPONSE
         self._response_ends = now + self.window_sec
         st = self.students[self.current]

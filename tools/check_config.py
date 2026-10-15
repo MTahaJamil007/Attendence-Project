@@ -195,6 +195,13 @@ def main() -> int:
     except Exception as exc:
         print(f"    FAIL import gating: {exc}")
         failures += 1
+    try:
+        from speech import SpeechWorker
+
+        consumers.append(("SpeechWorker", SpeechWorker))  # constructing it starts no thread
+    except Exception as exc:
+        print(f"    FAIL import speech: {exc}")
+        failures += 1
 
     for name, klass in consumers:
         try:
@@ -246,6 +253,43 @@ def main() -> int:
     checks.append(
         ("arm_straightness has a ramp but no weight (it is a multiplier)",
          "arm_straightness" in r["ramps"] and "arm_straightness" not in r["weights"], "")
+    )
+    checks.append(
+        ("forearm_vertical has a ramp but no weight (it is a multiplier)",
+         "forearm_vertical" in r["ramps"] and "forearm_vertical" not in r["weights"], "")
+    )
+    fv = r["ramps"].get("forearm_vertical", [0.0, 0.0])
+    checks.append(
+        ("forearm_vertical ramp descends (degrees from vertical: small = upright)",
+         fv[0] > fv[1], f"{fv[0]} > {fv[1]}")
+    )
+    fc = r["ramps"].get("face_clearance", [0.0, 0.0])
+    checks.append(
+        ("face_clearance ramp ascends and carries no weight (it modulates height)",
+         fc[0] < fc[1] and "face_clearance" not in r["weights"], f"{fc[0]} < {fc[1]}")
+    )
+    checks.append(
+        # Beyond ~0.4 torso a hand barely above the shoulder would count as a
+        # raise wherever it is held clear of the face.
+        ("0 <= beside_head_allowance <= 0.4", 0.0 <= r["beside_head_allowance"] <= 0.4,
+         f"{r['beside_head_allowance']}")
+    )
+    from roster import CALL_MODES
+
+    sp = cfg.section("speech")
+    checks.append(
+        (f"speech.mode is one of {CALL_MODES}", sp.get("mode") in CALL_MODES, f"{sp.get('mode')}")
+    )
+    checks.append(
+        ("speech.engine is auto / sapi / pyttsx3",
+         sp.get("engine", "auto") in ("auto", "sapi", "pyttsx3"), f"{sp.get('engine')}")
+    )
+    checks.append(
+        # A full registration number takes ~4.4 s to say. If the speech timeout
+        # is shorter, the window opens while the number is still being read.
+        ("max_speech_wait_sec leaves time to read a full registration number",
+         sp.get("mode") != "full" or s["max_speech_wait_sec"] >= 6.0,
+         f"{s['max_speech_wait_sec']}s, mode {sp.get('mode')}")
     )
     checks.append(
         ("lateral_penalty_start < lateral_penalty_end",

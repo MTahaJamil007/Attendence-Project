@@ -46,6 +46,10 @@ DEFAULT_GRID = {
     "temporal.hold_sec": [0.40, 0.60, 0.80],
     "temporal.ema_tau_sec": [0.12, 0.18, 0.25],
     "raise.straightness_floor": [0.20, 0.30, 0.40],
+    # How far below nose height a hand held clear of the face may be and still
+    # count. Higher accepts slighter raises; the sweep weighs that against the
+    # distractors in the recording.
+    "raise.beside_head_allowance": [0.15, 0.30],
 }
 SCORER_KEYS = ("raise.", "model.keypoint_conf", "model.keypoint_conf_floor")
 
@@ -253,6 +257,7 @@ def fmt(combo: dict) -> str:
         "temporal.hold_sec": "hold",
         "temporal.ema_tau_sec": "tau",
         "raise.straightness_floor": "straight",
+        "raise.beside_head_allowance": "beside",
         "model.keypoint_conf": "kpconf",
     }
     return "  ".join(f"{short.get(k, k)}={v}" for k, v in sorted(combo.items()))

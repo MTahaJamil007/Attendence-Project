@@ -27,9 +27,10 @@ import math
 from dataclasses import dataclass, field
 
 from geometry import (
-    NOSE,
     SIDE_JOINTS,
     angle_at_deg,
+    face_reference,
+    forearm_from_vertical_deg,
     ramp,
     torso_length,
 )
@@ -86,6 +87,7 @@ class RaiseScorer:
         self.lateral_end: float = raise_cfg["lateral_penalty_end"]
         self.straightness_floor: float = raise_cfg["straightness_floor"]
         self.min_torso_px: float = raise_cfg["min_torso_px"]
+        self.beside_head_allowance: float = raise_cfg["beside_head_allowance"]
 
         model_cfg = cfg.section("model")
         self.kp_conf: float = model_cfg["keypoint_conf"]
@@ -137,14 +139,28 @@ class RaiseScorer:
         raw["elbow_lift"] = elbow_lift
         feats["elbow_lift"] = ramp(elbow_lift, *self.ramps["elbow_lift"])
 
-        # Wrist above the head is strong confirmation. The nose is often missing
-        # for students facing away, so this feature drops out rather than being
-        # faked from a proxy - the weights renormalize below.
-        nx, ny, nc = kp[NOSE]
-        if nc >= self.kp_conf:
-            vext = (ny - wy) / torso
+        # Hand height relative to the face. The nose is preferred, then eyes,
+        # then ears; with no face keypoint at all this drops out rather than
+        # being faked from a proxy, and the weights renormalize below.
+        #
+        # How high is high enough depends on WHERE the hand is. A chin-rest, a
+        # hand on the cheek and a phone held up to look at all put the wrist in
+        # front of or against the face, at chin-to-cheek height - so a hand near
+        # the face must reach nose height to count. A hand held up clear of the
+        # face, beside the head or over the shoulder, is a raise even at chin
+        # height; that is what a relaxed "slight" raise looks like, and it is
+        # where none of those distractors sit. So the height requirement is
+        # relaxed by up to `beside_head_allowance` as the wrist moves clear.
+        face_x, face_y, _face_src = face_reference(kp, self.kp_conf)
+        if face_y is not None:
+            vext = (face_y - wy) / torso
+            clearance = abs(wx - face_x) / torso
+            beside = ramp(clearance, *self.ramps["face_clearance"])
             raw["vertical_extension"] = vext
-            feats["vertical_extension"] = ramp(vext, *self.ramps["vertical_extension"])
+            raw["face_clearance"] = clearance
+            feats["vertical_extension"] = ramp(
+                vext + beside * self.beside_head_allowance, *self.ramps["vertical_extension"]
+            )
 
         # Weighted mean over whichever features were available. Renormalizing by
         # the weights actually present is what lets a partially occluded student
@@ -167,11 +183,29 @@ class RaiseScorer:
         # forearm-up raise sits near 90 deg and must pass, while a hand tucked by
         # the head sits near 45 deg and must not. A floor above zero keeps this
         # graded rather than a veto.
+        #
+        # The elbow angle alone made students raise too high. A relaxed raise -
+        # elbow down by the ribs, forearm pointing up - also has a sharp elbow
+        # (~35 deg), so it was floored exactly like a head-scratch and only an
+        # elbow lifted to shoulder height could pass. What actually separates
+        # the two is the forearm's direction: a raise points it at the ceiling,
+        # a scratch slants it in toward the head. So the posture term takes the
+        # better of "arm is straight" and "forearm is upright".
+        #
+        # The upright-forearm route is only open when the face is visible. A
+        # phone held to the face also has an upright forearm; what separates it
+        # from a relaxed raise is where the wrist sits relative to the face -
+        # lower, and in front of it - which cannot be checked without a face
+        # keypoint. With no face the stricter elbow-angle rule applies alone, as
+        # it always did.
         angle = angle_at_deg(ex, ey, sx, sy, wx, wy)
         raw["arm_straightness"] = angle
-        straightness = self.straightness_floor + (1.0 - self.straightness_floor) * ramp(
-            angle, *self.ramps["arm_straightness"]
-        )
+        posture = ramp(angle, *self.ramps["arm_straightness"])
+        if face_y is not None:
+            fv = forearm_from_vertical_deg(ex, ey, wx, wy)
+            raw["forearm_vertical"] = fv
+            posture = max(posture, ramp(fv, *self.ramps["forearm_vertical"]))
+        straightness = self.straightness_floor + (1.0 - self.straightness_floor) * posture
         # Kept in `raw`, not `feats`: `feats` holds only terms that carry an entry
         # in self.weights, and anything recomputing total_w from it would KeyError.
         raw["straightness_factor"] = straightness
@@ -266,6 +300,7 @@ class TemporalRaiseTracker:
 
         self.states: dict[int, TrackState] = {}
         self._armed_at: float = 0.0
+        self._fresh_from: float = -self.fresh_lookback
 
     # -- call lifecycle ----------------------------------------------------
     def _is_fresh(self, st: TrackState) -> bool:
@@ -281,10 +316,19 @@ class TemporalRaiseTracker:
             return True
         if st.latched_at is None:
             return False
-        return st.latched_at >= self._armed_at - self.fresh_lookback
+        return st.latched_at >= self._fresh_from
 
-    def arm(self, now: float) -> None:
+    def arm(self, now: float, since: float | None = None) -> None:
         """Open a new response window.
+
+        *since* is when this roll number was first presented - shown on screen
+        and started being spoken. A hand raised at any point after that is
+        fresh, even if the window opens much later. That matters once the whole
+        registration number is read aloud: the call takes 4-5 s, and a student
+        who reads their number off the screen and raises at once would
+        otherwise be excluded as a hand "parked" before the window, and marked
+        absent with their hand up. The lookback still applies when it reaches
+        further back, so a short call behaves exactly as before.
 
         Also retires confirmations carried over from the previous call. Without
         this, a track that was confirmed once stayed confirmed for the rest of the
@@ -293,6 +337,9 @@ class TemporalRaiseTracker:
         subsequent roll number.
         """
         self._armed_at = now
+        self._fresh_from = now - self.fresh_lookback
+        if since is not None:
+            self._fresh_from = min(self._fresh_from, since)
         if not self.require_fresh:
             return
         for st in self.states.values():
@@ -303,6 +350,7 @@ class TemporalRaiseTracker:
     def reset(self) -> None:
         self.states.clear()
         self._armed_at = 0.0
+        self._fresh_from = -self.fresh_lookback
 
     # -- per-frame ---------------------------------------------------------
     def _alpha(self, dt: float) -> float:

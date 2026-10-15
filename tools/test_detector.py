@@ -23,26 +23,33 @@ from config import Config  # noqa: E402
 from gating import AttendanceGate, Verdict  # noqa: E402
 from geometry import (  # noqa: E402
     LEFT_ELBOW,
+    LEFT_EYE,
     LEFT_HIP,
     LEFT_SHOULDER,
     LEFT_WRIST,
     NOSE,
     RIGHT_ELBOW,
+    RIGHT_EYE,
     RIGHT_HIP,
     RIGHT_SHOULDER,
     RIGHT_WRIST,
+    face_reference,
+    forearm_from_vertical_deg,
 )
 from raise_detector import PersonScore, RaiseScorer, TemporalRaiseTracker, TrackState  # noqa: E402
 
 CFG = Config.load(ROOT / "config.json")
 
 # --- synthetic skeleton ---------------------------------------------------
-# Right shoulder at (220, 200), hips at y=300 -> torso = 100 px, nose at y=160.
-# y grows downward, so "above" means a smaller y.
+# Right shoulder at (220, 200), hips at y=300 -> torso = 100 px, nose at
+# (200, 160) on the body's midline, chin around y=178. y grows downward, so
+# "above" means a smaller y. Arms keep human proportions: the forearm (elbow to
+# wrist) is ~50 px, half a torso, so a pose cannot reach a height a real arm
+# could not.
 SHOULDER_Y = 200.0
 RIGHT_SHOULDER_X = 220.0
 HIP_Y = 300.0
-NOSE_XY = (218.0, 160.0)
+NOSE_XY = (200.0, 160.0)
 
 POSES: dict[str, tuple[float, float, float, float]] = {
     # name: (elbow_x, elbow_y, wrist_x, wrist_y)
@@ -51,15 +58,36 @@ POSES: dict[str, tuple[float, float, float, float]] = {
     "scratch_head": (250, 195, 205, 165),
     "sideways_stretch": (290, 190, 360, 185),
     "at_rest": (225, 260, 230, 310),
-    "phone_raised": (240, 215, 250, 170),
+    # Slight raises: forearm up, elbow left down. The old elbow-angle rule
+    # floored every one of these, which is why students had to lift the elbow to
+    # shoulder height - in practice the whole arm - before anything counted.
+    "slight_raise": (236, 212, 240, 162),     # hand at face height, elbow a little below the shoulder
+    "slight_raise_in": (226, 214, 224, 164),  # the same, wrist straight over the shoulder
+    "low_raise": (240, 230, 244, 180),        # elbow down by the side, hand up beside the head at chin height
+    # Distractors at face height with an upright forearm. What separates them
+    # from a slight raise is that the hand is in front of or against the face.
+    "phone_raised": (226, 224, 208, 178),     # phone held up in front of the face to look at it
+    "chin_rest": (212, 244, 203, 194),        # elbow on the desk, chin on the hand
+    "cheek_rest": (220, 226, 211, 177),       # elbow on the desk, hand against the cheek
 }
 
+GENUINE = ("straight_up_raise", "forearm_up_raise", "slight_raise",
+           "slight_raise_in", "low_raise")
+DISTRACTORS = ("scratch_head", "sideways_stretch", "at_rest", "phone_raised",
+               "chin_rest", "cheek_rest")
 
-def make_person(pose: str, conf: float = 0.9, nose_visible: bool = True):
+
+def make_person(pose: str, conf: float = 0.9, nose_visible: bool = True,
+                eyes_visible: bool = False):
     """Build a 17-point COCO skeleton with the right arm in *pose*."""
     ex, ey, wx, wy = POSES[pose]
     kp = [(0.0, 0.0, 0.0)] * 17
     kp[NOSE] = (NOSE_XY[0], NOSE_XY[1], conf if nose_visible else 0.0)
+    if eyes_visible:
+        # Eyes sit a little above the nose, so they make a slightly stricter
+        # face-height reference.
+        kp[LEFT_EYE] = (NOSE_XY[0] - 7.0, NOSE_XY[1] - 5.0, conf)
+        kp[RIGHT_EYE] = (NOSE_XY[0] + 7.0, NOSE_XY[1] - 5.0, conf)
     kp[LEFT_SHOULDER] = (180.0, SHOULDER_Y, conf)
     kp[RIGHT_SHOULDER] = (RIGHT_SHOULDER_X, SHOULDER_Y, conf)
     kp[LEFT_HIP] = (185.0, HIP_Y, conf)
@@ -110,6 +138,84 @@ def test_pose_discrimination() -> None:
     check(scores["phone_raised"] < enter, "raised phone at face height rejected", f"{scores['phone_raised']:.3f}")
     margin = scores["forearm_up_raise"] - scores["scratch_head"]
     check(margin > 0.30, "raise/distractor margin > 0.30", f"{margin:.3f}")
+    for name in ("slight_raise", "slight_raise_in", "low_raise"):
+        check(scores[name] > enter + 0.15, f"slight raise '{name}' passes with margin",
+              f"{scores[name]:.3f}")
+    check(scores["chin_rest"] < enter, "chin resting on hand rejected", f"{scores['chin_rest']:.3f}")
+    check(scores["cheek_rest"] < enter, "hand on cheek rejected", f"{scores['cheek_rest']:.3f}")
+    gap = min(scores[n] for n in GENUINE) - max(scores[n] for n in DISTRACTORS)
+    print(f"      weakest raise - strongest distractor = {gap:.3f}")
+    check(gap > 0.30, "every genuine raise beats every distractor by > 0.30", f"{gap:.3f}")
+    check(min(scores[n] for n in GENUINE) - enter > 0.15
+          and enter - max(scores[n] for n in DISTRACTORS) > 0.15,
+          "enter threshold sits inside the gap, >= 0.15 from both sides")
+
+
+def test_relaxed_raise_needs_a_face() -> None:
+    section("relaxed raise requires a visible face")
+    scorer = RaiseScorer(CFG)
+    enter = float(CFG.require("temporal.enter_threshold"))
+    # Nose hidden but eyes visible: the eyes stand in as the face reference, so
+    # a relaxed raise still counts.
+    eyes = scorer.score(make_person("slight_raise", nose_visible=False, eyes_visible=True), BBOX_H).score
+    print(f"      slight_raise, eyes only   score = {eyes:.3f}")
+    check(eyes > enter, "eyes stand in for a missing nose", f"{eyes:.3f}")
+    # No face at all: hand height relative to the face cannot be checked, and a
+    # phone held to the face has an upright forearm too - so the relaxed-raise
+    # route closes and the strict elbow-angle rule applies alone.
+    blind = {n: scorer.score(make_person(n, nose_visible=False), BBOX_H).score
+             for n in ("slight_raise", "low_raise", "phone_raised", "cheek_rest", "chin_rest")}
+    for n, v in blind.items():
+        print(f"      {n + ', no face':<26s}score = {v:.3f}")
+    check(all(v < enter for v in blind.values()),
+          "with no face keypoint, no face-height pose is accepted",
+          ", ".join(f"{k}={v:.2f}" for k, v in blind.items()))
+    check(scorer.score(make_person("forearm_up_raise", nose_visible=False), BBOX_H).score > enter,
+          "a clear raise still passes without any face keypoint")
+
+
+def test_beside_head_vs_in_front_of_face() -> None:
+    section("same height: beside the head counts, in front of the face does not")
+    scorer = RaiseScorer(CFG)
+    enter = float(CFG.require("temporal.enter_threshold"))
+    # One arm pose - elbow down, forearm upright, wrist at chin height - slid
+    # sideways from in front of the face to out over the shoulder. Only the
+    # horizontal position changes.
+    ex, ey, wx, wy = POSES["low_raise"]
+    rows = []
+    for dx in (-44, -34, -24, -14, 0):
+        POSES["_slide"] = (ex + dx, ey, wx + dx, wy)
+        clearance = abs(wx + dx - NOSE_XY[0]) / 100.0
+        rows.append((clearance, scorer.score(make_person("_slide"), BBOX_H).score))
+    del POSES["_slide"]
+    for c, v in rows:
+        print(f"      wrist {c:.2f} torso from the face -> score {v:.3f}")
+    check(rows[0][1] < enter, "in front of the face at chin height: rejected", f"{rows[0][1]:.3f}")
+    check(rows[-1][1] > enter, "beside the head at chin height: counts", f"{rows[-1][1]:.3f}")
+    check(all(a[1] <= b[1] + 1e-9 for a, b in zip(rows, rows[1:])),
+          "moving the hand clear of the face never lowers the score")
+    # Well above the face, position no longer matters.
+    check(scorer.score(make_person("slight_raise_in"), BBOX_H).score > enter,
+          "a hand at nose height counts even close to the face")
+
+
+def test_geometry_helpers() -> None:
+    section("forearm direction and face reference")
+    check(abs(forearm_from_vertical_deg(0, 100, 0, 0)) < 1e-6, "forearm straight up = 0 deg")
+    check(abs(forearm_from_vertical_deg(0, 0, 100, 0) - 90.0) < 1e-6, "horizontal = 90 deg")
+    check(abs(forearm_from_vertical_deg(0, 0, 0, 100) - 180.0) < 1e-6, "straight down = 180 deg")
+    check(forearm_from_vertical_deg(5, 5, 5, 5) == 180.0, "degenerate forearm never reads as up")
+    ex, ey, wx, wy = POSES["scratch_head"]
+    check(forearm_from_vertical_deg(ex, ey, wx, wy) > 45.0, "head-scratch forearm slants in",
+          f"{forearm_from_vertical_deg(ex, ey, wx, wy):.1f}")
+    kconf = float(CFG.require("model.keypoint_conf"))
+    x, y, src = face_reference(make_person("at_rest"), kconf)
+    check(src == "nose" and (x, y) == NOSE_XY, "nose preferred when visible", src)
+    x, y, src = face_reference(make_person("at_rest", nose_visible=False, eyes_visible=True), kconf)
+    check(src == "eyes" and (x, y) == (NOSE_XY[0], NOSE_XY[1] - 5.0),
+          "eyes used when nose missing, centred between them", f"{src} ({x}, {y})")
+    x, y, src = face_reference(make_person("at_rest", nose_visible=False), kconf)
+    check(x is None and y is None and src == "", "no face -> None, never a guess")
 
 
 def test_occluded_nose_still_rejects_distractor() -> None:
@@ -316,6 +422,49 @@ def test_eager_raise_within_lookback() -> None:
     check(n == 1, "a raise just before the window opens still counts")
 
 
+def _feed(tracker, t: float, until: float, score: float) -> float:
+    while t < until:
+        ps = PersonScore()
+        ps.score = score
+        ps.torso_px = 100.0
+        tracker.update(t, {1: (ps, (200.0, 100.0, 260.0, 360.0))})
+        t += 0.033
+    return t
+
+
+def test_freshness_counts_from_call_start() -> None:
+    section("freshness counts from when the number was called")
+    lookback = float(CFG.require("temporal.fresh_lookback_sec"))
+    speech = 4.4  # a full registration number, measured with SAPI at 175 wpm
+
+    # The student reads their number off the screen and raises at once, while it
+    # is still being read aloud - well over `lookback` before the window opens.
+    tracker = TemporalRaiseTracker(CFG)
+    call = 10.0
+    t = _feed(tracker, 9.0, call, 0.0)
+    t = _feed(tracker, t, call + speech, 1.0)
+    tracker.arm(t, since=call)
+    t = _feed(tracker, t, t + 0.3, 1.0)
+    n = len(tracker.confirmed())
+    print(f"      raised {speech:.1f}s before the window (lookback {lookback}s), since=call -> confirmed: {n}")
+    check(n == 1, "a raise during a long spoken call is fresh")
+
+    # Without `since` the same raise is outside the lookback - the bug this fixes.
+    tracker2 = TemporalRaiseTracker(CFG)
+    t = _feed(tracker2, 9.0, call, 0.0)
+    t = _feed(tracker2, t, call + speech, 1.0)
+    tracker2.arm(t)
+    t = _feed(tracker2, t, t + 0.3, 1.0)
+    check(len(tracker2.confirmed()) == 0, "(without since, it would be discarded as stale)")
+
+    # A hand already up before the call started is still stale.
+    tracker3 = TemporalRaiseTracker(CFG)
+    t = _feed(tracker3, 0.0, call + speech, 1.0)
+    tracker3.arm(t, since=call)
+    t = _feed(tracker3, t, t + 1.0, 1.0)
+    check(len(tracker3.confirmed()) == 0, "a hand parked up before the call still cannot answer")
+
+
 # =========================================================================
 # 3. Gating rules
 # =========================================================================
@@ -391,6 +540,9 @@ def main() -> int:
     tests = [
         test_pose_discrimination,
         test_occluded_nose_still_rejects_distractor,
+        test_relaxed_raise_needs_a_face,
+        test_beside_head_vs_in_front_of_face,
+        test_geometry_helpers,
         test_scale_invariance,
         test_confidence_floor,
         test_fps_independence,
@@ -398,6 +550,7 @@ def main() -> int:
         test_hysteresis_no_chatter,
         test_brief_raise_not_credited,
         test_fresh_raise_requirement,
+        test_freshness_counts_from_call_start,
         test_eager_raise_within_lookback,
         test_gating_rules,
         test_seat_zone_lock,

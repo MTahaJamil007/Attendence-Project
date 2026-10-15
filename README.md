@@ -9,7 +9,7 @@ See [PLAN.md](PLAN.md) for the full build plan and the review of the predecessor
 
 **Status: all four phases are built and verified on the real hardware.**
 
-185 tests pass, the config contract check is clean, the end-to-end pipeline runs,
+225 tests pass, the config contract check is clean, the end-to-end pipeline runs,
 the application launches with both windows, a complete roll call exports a
 register, a workbook, per-decision telemetry and evidence images, and the
 calibration toolchain sweeps thresholds against labelled footage.
@@ -17,6 +17,23 @@ calibration toolchain sweeps thresholds against labelled footage.
 Two things still need *you*, not more code: a real classroom recording to
 calibrate against, and the physical camera test. See
 [What still needs doing](#what-still-needs-doing).
+
+### Latest revision: the voice calls every student, and a slight raise counts
+
+* **The machine now reads each registration number aloud** - "S P two five,
+  B C S, zero zero seven" - and the student answers by raising a hand. Speech
+  existed before but was silent after the first sentence: pyttsx3 2.99 plays only
+  its first `runAndWait()`, and the startup announcement used it up. Speech now
+  drives Windows SAPI directly. See [The roll-call voice](#the-roll-call-voice).
+* **A slight raise counts.** Before, the elbow had to reach shoulder height -
+  in practice the whole arm went up. Now a hand held up beside the head counts
+  from about chin height with the elbow left down. A hand at that height *in
+  front of* the face (chin-rest, phone, hand on cheek) still does not. See
+  [Slight raises](#slight-raises).
+* Two bugs fixed on the way. A student who raised while the (now 4-5 s) number
+  was still being read was treated as a hand "parked" from the previous call and
+  never credited. And Pause did not stop the clock, so resuming after a long
+  pause marked the student Absent on the spot.
 
 ---
 
@@ -49,8 +66,9 @@ The torch wheel is ~2.44 GB, so the first install takes a while.
 ```bash
 run.bat app          # the application
 run.bat check        # runtime gate: CUDA, torchvision::nms, FP16
-run.bat test         # config contract + 185 tests (no GPU or camera needed)
+run.bat test         # config contract + 225 tests (no GPU or camera needed)
 run.bat ui           # UI construction/rendering tests only
+run.bat voice        # speak a few calls and confirm the audio really plays
 run.bat cameras      # list every working camera
 run.bat benchmark    # measure FPS, pick model + imgsz
 run.bat smoke        # headless end-to-end pipeline check (no window, RDP-safe)
@@ -83,8 +101,8 @@ src/
   video_worker.py        capture + inference threads, FPS and liveness stamps
   annotate.py            operator overlay and evidence crops
   liveness.py            the watchdog rule, isolated so it can be tested alone
-  roster.py              CSV/paste loading, shortest-unique spoken calls
-  speech.py              pyttsx3 worker thread, warmed at startup
+  roster.py              CSV/paste loading, spoken calls (full reg or shortest unique)
+  speech.py              SAPI voice worker (pyttsx3 fallback), warmed at startup
   session.py             roll-call state machine + per-decision telemetry
   evidence.py            captioned crop of the credited student
   export.py              CSV / XLSX / session JSON, with a Pending guard
@@ -94,15 +112,16 @@ src/
 data/
   botsort_static.yaml    BoT-SORT with motion compensation off (see below)
 tools/
-  test_detector.py       33 scoring / temporal / gating tests, no torch needed
+  test_detector.py       58 scoring / temporal / gating tests, no torch needed
   test_liveness.py       20 watchdog tests, incl. replay of the predecessor's stalls
-  test_session.py        49 state-machine tests, incl. a replayed 52s stall
+  test_session.py        64 state-machine tests, incl. a replayed 52s stall
   test_export.py         40 export + evidence tests, incl. the Pending guard
   test_calibrate.py      30 calibration replay/sweep tests on synthetic footage
   record.py              scripted ground-truth recorder
   extract.py             pose inference cached to .npz, once per model
   calibrate.py           threshold sweep, recall/precision report, --apply
   test_ui.py             13 UI construction/render tests, real windows, ~1s
+  voice_check.py         audible check that every call actually plays (run.bat voice)
   check_config.py        code/config contract + value sanity checks
   benchmark.py           model x imgsz sweep with stage split and validity warnings
   smoke.py               headless end-to-end pipeline check
@@ -232,19 +251,24 @@ flickered with pixel-level keypoint noise.
 Each term is now a ramp in [0, 1] combined as a weighted mean. One physical
 necessity stays hard: a raised hand has its wrist above its shoulder.
 
-Measured on synthetic poses (`run.bat test`):
+Measured on synthetic poses with human proportions (`run.bat test`):
 
 | pose | score |
 |---|---|
 | straight-up raise | **1.000** |
-| forearm-up raise | **0.730** |
-| raised phone at face height | 0.251 |
-| head-scratch | 0.199 |
-| sideways stretch | 0.084 |
+| forearm-up raise, elbow at shoulder height | **1.000** |
+| slight raise, hand at face height | **0.950** |
+| slight raise, wrist straight over the shoulder | **0.936** |
+| low raise, elbow down, hand beside the head at chin height | **0.821** |
+| hand against the cheek | 0.293 |
+| phone held up in front of the face | 0.275 |
+| sideways stretch | 0.208 |
+| chin resting on the hand | 0.172 |
+| head-scratch | 0.169 |
 | arm at rest | 0.000 (hard gate) |
 
-Enter threshold is 0.55, so the nearest distractor sits 0.30 below the nearest
-genuine raise.
+Enter threshold is 0.55, so the weakest genuine raise sits 0.27 above it and the
+strongest distractor 0.26 below it: a 0.53 gap.
 
 **Elbow extension is a multiplier, not a weighted term.** This was a real
 correction made during the build: as a 0.14-weight term a head-scratch scored
@@ -254,6 +278,61 @@ nose keypoint occluded. As a multiplier with a 0.30 floor the same pose scores
 ramp runs 50->110 degrees rather than 70->150, because a forearm-up raise sits
 near 90 degrees and must pass while a hand tucked by the head sits near 45 and
 must not.
+
+### Slight raises
+
+The elbow-angle multiplier had a side effect: it made students raise too high. A
+relaxed raise - elbow left down, forearm pointing up - also has a sharp elbow
+angle (~35 degrees), so it was floored exactly like a head-scratch. Only an elbow
+lifted to shoulder height escaped the floor, which in practice means the whole arm
+goes up. With the elbow down, **no hand height at all** was enough.
+
+Two changes fix that without letting the distractors in:
+
+1. **Posture is "arm straight" OR "forearm upright".** The multiplier takes the
+   better of the elbow angle and the forearm's direction
+   (`raise.ramps.forearm_vertical`, degrees from vertical). A raise points the
+   forearm at the ceiling; a head-scratch slants it in toward the head (56 degrees
+   in the test pose), so it is still floored.
+2. **How high is high enough depends on where the hand is.** A chin-rest, a hand on
+   the cheek and a phone held up to look at all put the wrist *in front of or
+   against the face*, at chin-to-cheek height, so a hand near the face must still
+   reach nose height. A hand held *clear of the face* - beside the head, over the
+   shoulder - is a raise even at chin height, and none of those distractors sit
+   there. `raise.beside_head_allowance` (0.30 torso lengths) is how much lower it
+   may be; `raise.ramps.face_clearance` is how far from the face counts as "clear".
+
+With a forearm half a torso long, pointing up, as the elbow is lowered:
+
+| elbow vs shoulder | wrist vs nose | old | new |
+|---|---|---|---|
+| +0.10 torso | +0.20 | counts | counts |
+| level | +0.10 | counts | counts |
+| 0.10 below | level | no | counts |
+| 0.19 below | 0.09 below | no | counts |
+| 0.28 below | 0.17 below | no | counts |
+| 0.35 below | 0.25 below (about chin height) | no | counts |
+| 0.42 below | 0.32 below | no | no |
+
+A torso length is roughly 50 cm, so the lowest hand that counts has dropped by
+about 17 cm at both the elbow and the wrist.
+
+The face-height rule needs a face. The nose is preferred, then the eyes, then the
+ears. **With no face keypoint at all**, the upright-forearm route closes and the
+original elbow-angle rule applies alone: a phone held to the face also has an
+upright forearm, and without a face there is no way to tell them apart. A student
+facing the camera always has a face keypoint, so this only affects students
+turned away.
+
+Known limit: a phone held **at the ear** (a call) puts the wrist at face height
+beside the head and will read as a raise. Seventeen keypoints have no hand shape to
+tell them apart. Hands held still for a long time (resting a head on a fist) cannot
+answer, because a raise must start after the number is called.
+
+To accept even lower hands, raise `beside_head_allowance` toward 0.4 (the config
+check refuses more), or lower both ends of `raise.ramps.vertical_extension`. Each
+step brings the chin-rest and phone poses closer to the threshold, so re-run
+`run.bat test` and, better, calibrate on real footage.
 
 Scores are normalized by torso length, so they are invariant to how far away a
 student sits — verified to within 0.0001 across a 4x scale change.
@@ -353,13 +432,44 @@ they are the two that stop it writing a confident wrong answer.
   `max_speech_wait_sec`, whichever is first, so a hung SAPI engine cannot freeze
   the roll call. With no TTS engine at all it simply proceeds.
 
-### Shortest unique spoken calls
+### The roll-call voice
 
-The screen shows `SP25-BCS-007`; the speaker says **"seven"**. Reading the whole
-string aloud takes about four seconds — longer than the response window itself.
+The screen shows `SP25-BCS-007` and the machine reads it aloud: **"S P two five,
+B C S, zero zero seven"**. That is `speech.mode: "full"`, the default. Digits are
+read one at a time, the way a registration number is read, and the commas make
+the voice pause between parts so it is intelligible from the back row. At
+`speech.rate: 175` wpm a call takes about 4.4 s (measured, SAPI, Zira).
 
-The spoken form escalates only as far as it must to stay unambiguous across the
-loaded roster:
+**Why the voice was silent before.** Measured on this machine with pyttsx3 2.99,
+only the *first* `runAndWait()` plays. Every later call returns in about 0.15 s
+having played nothing: a sentence that takes 4 s to say "finished" in 0.24 s. The
+startup announcement was that first call, so every roll number after it was
+silent. The completion events still arrived on time, so nothing looked wrong. The
+worker now drives `SAPI.SpVoice` through comtypes (already a dependency; pyttsx3
+uses it underneath), which plays every utterance at full length. pyttsx3 remains
+the fallback where SAPI does not exist (`speech.engine: auto | sapi | pyttsx3`).
+
+`run.bat voice` speaks a few calls and times them. An utterance that finishes
+faster than its words could be said is reported as **SILENT**, which is exactly how
+the old bug would have shown up.
+
+**Raising during the call counts.** The number is on the screen from the moment
+the call starts, so many students raise before the voice finishes. Freshness (a
+raise must be new, so a hand left up from the previous student cannot answer) is
+measured from the start of the call, not from when the window opens. Before this
+fix, with a 4-5 s call, a student who raised straight away was treated as a
+"parked" hand and was never credited, even with the hand held up.
+
+`session.max_speech_wait_sec` is 8 s, so the window never opens halfway through a
+number. Pausing cuts the voice off mid-word, and resuming reads the interrupted
+number again from the start.
+
+#### The faster alternative: shortest unique calls
+
+`speech.mode: "short_unique"` says only as much as the roster needs, e.g.
+**"seven"**. It is about 4 s faster per student, but students have to know their
+number by its last digits. The spoken form escalates only as far as it must to
+stay unambiguous across the loaded roster:
 
 | level | form | example |
 |---|---|---|
@@ -429,11 +539,22 @@ plus one asserting the boundary behaviour.
 
 ### Another cold-start penalty
 
-Same shape as the GPU clock finding in Phase 1: the first SAPI utterance takes
-**2.5 s** while later ones take **0.10–0.18 s**, because the audio device is
-initialized lazily. Without a warm-up that penalty lands on the first student
-called. The engine now speaks a short startup announcement, which doubles as an
-audible check that output and volume work before a class is waiting on it.
+Same shape as the GPU clock finding in Phase 1: the first utterance pays about
+2 s of audio-device initialization that later ones do not. Without a warm-up that
+penalty lands on the first student called. The engine speaks a short startup
+announcement, which doubles as an audible check that output and volume work before
+a class is waiting on it.
+
+(An earlier version of this section said later utterances took 0.10-0.18 s. That
+was the pyttsx3 silent-repeat bug being measured, not speech: nothing was playing.
+See [The roll-call voice](#the-roll-call-voice).)
+
+### Pause stops the clock
+
+Pause used to leave the deadlines running, so pausing mid-window for longer than
+the time left marked the student Absent the moment the teacher resumed. The window
+now resumes with exactly the time it had left, a result on screen keeps its hold
+time, and a call interrupted mid-sentence is read again from the start.
 
 ---
 
@@ -650,12 +771,20 @@ Everything lives in `config.json`.
 | `model.min_person_height_px` | `90` | below this, keypoints are noise |
 | `camera.fourcc` | `MJPG` | required for 1080p30 over USB 2.0 |
 | `raise.weights` | — | four ramped features, must sum to 1.0 |
-| `raise.straightness_floor` | `0.30` | elbow-extension multiplier floor |
+| `raise.straightness_floor` | `0.30` | posture multiplier floor |
+| `raise.ramps.forearm_vertical` | `[45, 20]` | degrees from vertical; an upright forearm passes the posture check even with the elbow down |
+| `raise.beside_head_allowance` | `0.30` | how far below nose height (torso lengths) a hand held clear of the face may be; higher = slighter raises |
+| `raise.ramps.face_clearance` | `[0.12, 0.25]` | wrist-to-face distance (torso lengths) that counts as clear of the face |
 | `temporal.ema_tau_sec` | `0.18` | smoothing time constant, not a frame count |
 | `temporal.enter/exit_threshold` | `0.55` / `0.35` | Schmitt trigger band |
 | `temporal.hold_sec` | `0.60` | wall-clock hold before crediting |
 | `temporal.track_grace_sec` | `0.50` | detection dropout absorbed without decay |
 | `session.response_window_sec` | `6.0` | up from the predecessor's 4.0 |
+| `session.max_speech_wait_sec` | `8.0` | longer than a full registration number takes to say |
+| `speech.mode` | `full` | `full` reads the whole registration number; `short_unique` says e.g. "seven" |
+| `speech.engine` | `auto` | `auto` = SAPI on Windows, else pyttsx3 |
+| `speech.rate` | `175` | words per minute |
+| `speech.voice` | `""` | part of a voice name, e.g. `Hazel` for the British voice |
 | `session.stall_threshold_sec` | `0.75` | liveness limit for the watchdog |
 | `gating.require_single_hand` | `true` | Rule A |
 | `gating.one_credit_per_track` | `true` | Rule B |

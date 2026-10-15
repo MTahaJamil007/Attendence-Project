@@ -18,7 +18,16 @@ sys.path.insert(0, str(ROOT / "src"))
 from config import Config  # noqa: E402
 from gating import AttendanceGate  # noqa: E402
 from raise_detector import PersonScore, TemporalRaiseTracker  # noqa: E402
-from roster import ABSENT, PENDING, PRESENT, Student, assign_short_unique_calls  # noqa: E402
+from roster import (  # noqa: E402
+    ABSENT,
+    PENDING,
+    PRESENT,
+    Student,
+    assign_calls,
+    assign_short_unique_calls,
+    full_call,
+    parse_pasted,
+)
 from session import Phase, Session  # noqa: E402
 from speech import SpeechEvent  # noqa: E402
 
@@ -56,17 +65,25 @@ class FakeSpeech:
         return out
 
     def clear(self) -> None:
-        pass
+        self.cleared += 1
+
+    cleared = 0
+
+    def finish(self) -> None:
+        """Report the most recent utterance as spoken, for slow-speech tests."""
+        if self.spoken:
+            self._events.append(SpeechEvent(token=self.spoken[-1][0], kind="spoken"))
 
 
-def make_session(n: int = 3, live: bool = True, speech: FakeSpeech | None = None):
+def make_session(n: int = 3, live: bool = True, speech: FakeSpeech | None = None, cfg=None):
     students = [Student(roll=f"SP25-BCS-{i + 1:03d}") for i in range(n)]
     assign_short_unique_calls(students)
     video = FakeVideo(live=live)
-    tracker = TemporalRaiseTracker(CFG)
-    gate = AttendanceGate(CFG)
+    cfg = cfg or CFG
+    tracker = TemporalRaiseTracker(cfg)
+    gate = AttendanceGate(cfg)
     sp = speech if speech is not None else FakeSpeech()
-    sess = Session(CFG, video, tracker, gate, sp)
+    sess = Session(cfg, video, tracker, gate, sp)
     sess.set_students(students)
     return sess, students, video, tracker, gate, sp
 
@@ -112,7 +129,8 @@ def test_happy_path() -> None:
     sess, students, _v, tracker, _g, sp = make_session(3)
     check(sess.start(0.0), "start() succeeds with a roster")
     check(sess.phase is Phase.CALLING, "phase is CALLING first", sess.phase)
-    check(sp.spoken and sp.spoken[0][1] == "one", "spoke the short form", str(sp.spoken[:1]))
+    check(sp.spoken and sp.spoken[0][1] == "S P two five, B C S, zero zero one",
+          "reads the full registration number aloud", str(sp.spoken[:1]))
 
     view, t = drive(sess, tracker, 0.0, 1.0, score=0.0)
     check(sess.phase is Phase.RESPONSE, "window opens after speech + reaction delay", sess.phase)
@@ -372,16 +390,84 @@ def test_finishes() -> None:
 
 def test_pause_resume() -> None:
     section("pause and resume")
-    sess, students, _v, tracker, _g, _sp = make_session(2)
+    sess, students, _v, tracker, _g, sp = make_session(2)
     sess.start(0.0)
     _v2, t = drive(sess, tracker, 0.0, 1.0, score=0.0)
-    sess.pause()
+    before = sess.view(t).remaining
+    sess.pause(t)
     check(sess.phase is Phase.PAUSED, "pauses", sess.phase)
+    check(sp.cleared >= 1, "pausing silences the voice")
     _v2, t = drive(sess, tracker, t, t + 20.0, score=0.0, step=0.25)
     check(students[0].status == PENDING, "paused sessions never auto-mark",
           students[0].status)
     sess.start(t)
     check(sess.phase is Phase.RESPONSE, "resumes into RESPONSE", sess.phase)
+    # The 20 s pause is far longer than the window. Before the fix, deadlines were
+    # absolute, so the student was marked Absent on the very next tick.
+    after = sess.view(t).remaining
+    check(abs(after - before) < 0.3, "the window resumes with the time it had left",
+          f"{before:.2f}s before pause, {after:.2f}s after")
+    sess.tick(t + 0.05)
+    check(students[0].status == PENDING, "not marked Absent the moment it resumes",
+          students[0].status)
+    _v2, t = drive(sess, tracker, t, t + after + 0.5, score=0.0)
+    check(students[0].status == ABSENT, "times out normally once the rest has elapsed",
+          students[0].status)
+
+
+def test_pause_during_call_rereads() -> None:
+    section("pause while the number is being read")
+    slow = FakeSpeech(available=True, auto_complete=False)
+    sess, students, _v, tracker, _g, sp = make_session(1, speech=slow)
+    sess.start(0.0)
+    _v2, t = drive(sess, tracker, 0.0, 1.0, score=0.0)
+    sess.pause(t)
+    _v2, t = drive(sess, tracker, t, t + 5.0, score=0.0)
+    sess.start(t)
+    check(sess.phase is Phase.CALLING, "resumes by calling the number again", sess.phase)
+    check(len(sp.spoken) == 2 and sp.spoken[0][1] == sp.spoken[1][1],
+          "the interrupted number is read again in full", str([x[1] for x in sp.spoken]))
+    check(sp.spoken[1][0] != sp.spoken[0][0], "with a new token, so a stale event cannot open the window")
+
+
+def test_call_modes() -> None:
+    section("spoken call modes")
+    check(full_call("SP25-BCS-007") == "S P two five, B C S, zero zero seven",
+          "full: every part, digits read individually", full_call("SP25-BCS-007"))
+    check(full_call(" FA24_BSE_120 ") == "F A two four, B S E, one two zero",
+          "full: trims and splits on any separator", full_call(" FA24_BSE_120 "))
+    check(full_call("12345") == "one two three four five", "full: bare numeric roll")
+    students = parse_pasted("SP25-BCS-001 SP25-BCS-007")
+    assign_calls(students, "short_unique")
+    check([x.spoken_call for x in students] == ["one", "seven"], "short_unique still available",
+          str([x.spoken_call for x in students]))
+    try:
+        assign_calls(students, "loud")
+        check(False, "an unknown mode is rejected")
+    except ValueError:
+        check(True, "an unknown mode is rejected")
+
+    short_cfg = CFG.override({"speech": {"mode": "short_unique"}})
+    sess, _st, _v, _t, _g, sp = make_session(2, cfg=short_cfg)
+    sess.start(0.0)
+    check(sp.spoken and sp.spoken[0][1] == "one", "session honours speech.mode",
+          str(sp.spoken[:1]))
+
+
+def test_raise_during_long_call_credited() -> None:
+    section("raise while the full number is still being read")
+    slow = FakeSpeech(available=True, auto_complete=False)
+    sess, students, _v, tracker, _g, sp = make_session(2, speech=slow)
+    sess.start(0.0)
+    # The student reads their number off the screen and raises at once, while
+    # the voice is still reading it (4.4 s for a full registration number).
+    _v2, t = drive(sess, tracker, 0.0, 4.4, score=1.0)
+    check(sess.phase is Phase.CALLING, "still calling while the voice speaks", sess.phase)
+    slow.finish()
+    _v2, t = drive(sess, tracker, t, t + 2.0, score=1.0)
+    check(students[0].status == PRESENT,
+          "credited: a raise during the call is fresh, not a parked hand",
+          students[0].status)
 
 
 def main() -> int:
@@ -398,6 +484,9 @@ def main() -> int:
         test_undo,
         test_finishes,
         test_pause_resume,
+        test_pause_during_call_rereads,
+        test_call_modes,
+        test_raise_during_long_call_credited,
     ):
         fn()
 

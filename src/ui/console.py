@@ -269,7 +269,7 @@ class Console:
         self.session.start(time.monotonic())
 
     def pause(self) -> None:
-        self.session.pause()
+        self.session.pause(time.monotonic())
 
     def toggle_run(self) -> None:
         if self.session.phase in (Phase.IDLE, Phase.PAUSED, Phase.FINISHED):
@@ -478,7 +478,7 @@ class Console:
             live,
         ]
         if self.speech.available:
-            bits.append("tts")
+            bits.append(f"tts {getattr(self.speech, 'backend', '')}".rstrip())
         elif self.speech.error:
             bits.append("tts off")
         if st["error"]:

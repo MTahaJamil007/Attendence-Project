@@ -1,6 +1,6 @@
 @echo off
 REM Task launcher.
-REM Usage: run.bat [app|check|test|ui|cameras|benchmark|smoke|preview]
+REM Usage: run.bat [app|check|test|ui|voice|cameras|benchmark|smoke|preview]
 REM Calibration: run.bat [record|extract|calibrate] -- see README
 setlocal
 set PY=.venv\Scripts\python.exe
@@ -15,6 +15,7 @@ if /i "%1"=="app"       goto app
 if /i "%1"=="check"     goto check
 if /i "%1"=="test"      goto test
 if /i "%1"=="ui"        goto uitest
+if /i "%1"=="voice"     goto voice
 if /i "%1"=="cameras"   goto cameras
 if /i "%1"=="benchmark" goto benchmark
 if /i "%1"=="smoke"     goto smoke
@@ -23,7 +24,7 @@ if /i "%1"=="record"    goto record
 if /i "%1"=="extract"   goto extract
 if /i "%1"=="calibrate" goto calibrate
 echo Unknown task "%1".
-echo Valid: app check test ui cameras benchmark smoke preview record extract calibrate
+echo Valid: app check test ui voice cameras benchmark smoke preview record extract calibrate
 exit /b 1
 
 :app
@@ -52,6 +53,10 @@ exit /b %errorlevel%
 
 :uitest
 %PY% tools\test_ui.py
+exit /b %errorlevel%
+
+:voice
+%PY% tools\voice_check.py %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :cameras

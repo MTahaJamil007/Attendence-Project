@@ -1,14 +1,18 @@
-"""Roster loading and shortest-unique spoken calls.
+"""Roster loading and spoken calls.
 
-The spoken-call idea is taken from the predecessor, which had it right: the screen
-shows the full roll number (`SP25-BCS-007`) while the speaker says only what is
-needed to identify it uniquely (`seven`). Reading the whole string aloud -
-"ess pee two five bee see ess zero zero seven" - takes about four seconds per
-student, which is longer than the response window itself and would make a 60-person
-class unbearable.
+By default (``speech.mode: "full"``) the whole registration number is read out -
+"S P two five, B C S, zero zero seven" - because that is how a teacher calls a
+register and it is what students listen for. See :func:`full_call`.
 
-The logic here picks the shortest form that is still unambiguous across the loaded
-roster, escalating only when it has to:
+``speech.mode: "short_unique"`` is the faster alternative, taken from the
+predecessor: the screen shows the full roll number (`SP25-BCS-007`) while the
+speaker says only what is needed to identify it uniquely (`seven`). The full form
+takes about 4.4 s per student, so across a 60-person class this saves roughly
+four minutes, at the cost of students having to know their number by its last
+digits.
+
+The short-unique logic picks the shortest form that is still unambiguous across
+the loaded roster, escalating only when it has to:
 
     level 0   number only            "seven"
     level 1   program + number       "B C S seven"
@@ -169,6 +173,37 @@ def assign_short_unique_calls(students: list[Student]) -> int:
     for s in students:
         s.spoken_call = spoken_component(s.roll)
     return 3
+
+
+def full_call(roll: str) -> str:
+    """The whole registration number, read part by part.
+
+    "SP25-BCS-007" -> "S P two five, B C S, zero zero seven". Every digit is read
+    individually, the way a registration number is read out, and the commas make
+    the voice pause between parts so the number stays intelligible from the back
+    of a room. Measured with SAPI: about 4.4 s per student at 175 wpm.
+    """
+    parts = [p for p in _SPLIT.split(roll.strip()) if p]
+    spoken = [spoken_component(p) for p in parts]
+    return ", ".join(s for s in spoken if s) or roll.strip()
+
+
+CALL_MODES = ("full", "short_unique")
+
+
+def assign_calls(students: list[Student], mode: str) -> None:
+    """Set every student's spoken call for the configured ``speech.mode``.
+
+    ``full`` reads the whole registration number; ``short_unique`` says only as
+    much as the loaded roster needs to be unambiguous (usually just "seven").
+    """
+    if mode == "short_unique":
+        assign_short_unique_calls(students)
+        return
+    if mode != "full":
+        raise ValueError(f"unknown speech.mode {mode!r}; expected one of {CALL_MODES}")
+    for s in students:
+        s.spoken_call = full_call(s.roll)
 
 
 # --- loading ---------------------------------------------------------------

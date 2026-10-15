@@ -59,6 +59,10 @@ SCRIPT = [
     ("idle", "at_rest", False, 3.0),
     ("raise_high", "straight_up_raise", True, 4.0),
     ("idle", "at_rest", False, 3.0),
+    ("raise_low", "low_raise", True, 4.0),
+    ("idle", "at_rest", False, 3.0),
+    ("lean", "chin_rest", False, 4.0),
+    ("idle", "at_rest", False, 3.0),
 ]
 
 
@@ -113,7 +117,7 @@ def test_replay_on_clean_footage() -> None:
     m = C.replay(scored, labels["segments"], CFG)
     print(f"      TP={m.tp} FN={m.fn} FP={m.fp} TN={m.tn}  "
           f"recall={m.recall:.1%} precision={m.precision:.1%}")
-    check(m.tp + m.fn == 3, "three genuine raises evaluated", f"{m.tp + m.fn}")
+    check(m.tp + m.fn == 4, "four genuine raises evaluated", f"{m.tp + m.fn}")
     check(m.recall == 1.0, "every genuine raise detected", f"{m.recall:.1%}")
     check(m.fp == 0, "no distractor fired", f"fp={m.fp} {m.fp_by_kind}")
     check(m.precision == 1.0, "precision 1.0 on clean footage", f"{m.precision:.1%}")
@@ -155,13 +159,15 @@ def test_threshold_sensitivity_is_visible() -> None:
     section("sensitivity")
     labels, data = build_recording()
     frames, _s, _u = C.group_by_frame(data, float(CFG.require("model.min_person_height_px")))
-    # An absurdly high enter threshold must destroy recall; the sweep has to be
+    # An unreachable enter threshold must destroy recall; the sweep has to be
     # able to see that, or it cannot distinguish a good setting from a bad one.
-    high = CFG.override({"temporal": {"enter_threshold": 0.99, "exit_threshold": 0.9}})
+    # Scores are clamped to [0, 1] and a textbook raise saturates at exactly 1.0,
+    # so only a threshold above 1 is truly unreachable.
+    high = CFG.override({"temporal": {"enter_threshold": 1.01, "exit_threshold": 0.9}})
     m_high = C.replay(C.score_frames(frames, high), labels["segments"], high)
     low = CFG.override({"temporal": {"enter_threshold": 0.05, "exit_threshold": 0.02}})
     m_low = C.replay(C.score_frames(frames, low), labels["segments"], low)
-    print(f"      enter=0.99 -> recall {m_high.recall:.1%}, fp {m_high.fp}")
+    print(f"      enter=1.01 -> recall {m_high.recall:.1%}, fp {m_high.fp}")
     print(f"      enter=0.05 -> recall {m_low.recall:.1%}, fp {m_low.fp}")
     check(m_high.recall < 1.0, "an unreachable threshold loses recall", f"{m_high.recall:.1%}")
     check(m_low.fp > 0, "a permissive threshold admits distractors", f"fp={m_low.fp}")
