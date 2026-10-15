@@ -9,7 +9,7 @@ See [PLAN.md](PLAN.md) for the full build plan and the review of the predecessor
 
 **Status: all four phases are built and verified on the real hardware.**
 
-352 tests pass, the config contract check is clean, the end-to-end pipeline runs,
+360 tests pass, the config contract check is clean, the end-to-end pipeline runs,
 the application launches with both windows, a complete roll call exports a
 register, a workbook, per-decision telemetry and evidence images, and the
 calibration toolchain sweeps thresholds against labelled footage.
@@ -88,7 +88,7 @@ The torch wheel is ~2.44 GB, so the first install takes a while.
 ```bash
 run.bat app          # the application
 run.bat check        # runtime gate: CUDA, torchvision::nms, FP16
-run.bat test         # config contract + 352 tests (no GPU or camera needed)
+run.bat test         # config contract + 360 tests (no GPU or camera needed)
 run.bat ui           # UI construction/rendering tests only
 run.bat voice        # speak a few calls and confirm the audio really plays
 run.bat cameras      # list every working camera
@@ -147,7 +147,7 @@ tools/
   record.py              scripted ground-truth recorder
   extract.py             pose inference cached to .npz, once per model
   calibrate.py           threshold sweep, recall/precision report, --apply
-  test_ui.py             21 UI construction/render tests, real windows, ~1s
+  test_ui.py             29 UI construction/render/layout tests, real windows, ~6s
   test_seats.py          72 seat-memory tests, incl. the reported "answered twice" case
   test_netcam.py         47 phone-camera tests against local imitation phone servers
   phone_check.py         find a phone camera, measure its FPS and gaps (run.bat phone)
@@ -589,11 +589,48 @@ run.bat app
 run.bat app --roster "C:\path\to\roster.csv"
 ```
 
-Order of operations: **Load CSV** (or Paste Rolls) → **Start Camera** → **Roll
-Screen** onto the projector, F11 for fullscreen → **Start Attendance**.
+Order of operations: **Load CSV** (or Paste Rolls) → **Start Camera** (or
+**Phone Camera**) → **Start Attendance**. The student display opens on the
+projector by itself when one is connected; press F11 there for fullscreen.
 
 Keyboard, so the teacher never has to find a button mid-call:
 `P` present, `A` absent, `U` undo, `Space` start/pause, `F11` fullscreen display.
+
+### The console layout
+
+```
+ ROLL LIST        CAMERA                          ATTENDANCE                       RECORDS
+[Load CSV][Paste] [Start][Switch][Phone Camera]   [Start Attendance][Pause][Roll Screen] [Export][Reset]
++-------------------------------------------------+------------------------------+
+|                                                 | CURRENT CALL                 |
+|                                                 | SP25-BCS-004                 |
+|              camera feed                        | RESPONSE 4.2s                |
+|      (full height, letterboxed to fit)          | message, wrapped (4 lines)   |
+|                                                 | [Present P][Absent A][Undo U]|
+|                                                 +------------------------------+
+|                                                 | roster                       |
++-------------------------------------------------+------------------------------+
+ status bar: stage  camera  fps  device  gpu load ...
+```
+
+Every region's size is set by the window, never by its contents. The previous
+layout let text decide: one long message (the seat-memory explanation) grew the
+window from 1560 to 1920 px and pushed Present / Absent / Undo out of view at
+exactly the moment the teacher was asked to press them, and the video area changed
+size with every status change. Now the video is drawn into a fixed area, the
+message wraps inside a fixed-width panel, and the status bar clips. The window
+also sizes itself to the screen it opens on.
+
+**The student display no longer covers the camera feed.** Start Attendance used to
+open it in front of the console - on a single laptop screen, right over the video
+- and it took the keyboard, so `P` / `A` / `U` did nothing until the teacher
+clicked back. Now, with a projector connected, it opens on the projector (F11 there
+for fullscreen). With one screen, it opens *behind* the console; **Roll Screen**
+brings it forward. Either way the console keeps the keyboard.
+
+Closing: the window's X shuts everything down in under half a second (measured:
+camera and model 0.32 s, speech 0.15 s). Ctrl+C in the terminal now does the same
+clean shutdown instead of printing a tkinter traceback.
 
 ### The state machine
 

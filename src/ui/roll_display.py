@@ -49,6 +49,47 @@ ABSENT_COLOR = "#fb7185"
 PARTIAL_COLOR = "#facc15"
 
 
+def monitors() -> list[tuple[tuple[int, int, int, int], bool]]:
+    """Every monitor as ((left, top, right, bottom), is_primary). Windows only.
+
+    Returns an empty list where the query is not available, which callers
+    treat as "one screen".
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        found: list[tuple[tuple[int, int, int, int], bool]] = []
+        proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC,
+                                  ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+        def cb(hmon, _hdc, _rect, _data):
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                r = info.rcMonitor
+                found.append(((r.left, r.top, r.right, r.bottom), bool(info.dwFlags & 1)))
+            return 1
+
+        user32.EnumDisplayMonitors(None, None, proc(cb), 0)
+        return found
+    except Exception:
+        return []
+
+
+def secondary_monitor() -> tuple[int, int, int, int] | None:
+    """The first non-primary monitor (a projector), or None with one screen."""
+    for rect, primary in monitors():
+        if not primary:
+            return rect
+    return None
+
+
 class RollDisplay:
     """A Toplevel showing the current roll number, countdown and feedback."""
 
@@ -62,6 +103,7 @@ class RollDisplay:
         self.win.minsize(480, 320)
         self._fullscreen = False
         self._w, self._h = 1100, 650
+        self.on_projector = False
         self._roll_shown = None
 
         self.canvas = tk.Canvas(self.win, bg=BG, highlightthickness=0, bd=0)
@@ -111,6 +153,33 @@ class RollDisplay:
         self._fullscreen = False
         try:
             self.win.attributes("-fullscreen", False)
+        except Exception:
+            pass
+
+    def place_on_secondary_monitor(self) -> bool:
+        """Move the window onto a second monitor (the projector), if there is one.
+
+        Returns True when it was moved. Only the position changes; F11 still
+        toggles fullscreen, now on the projector instead of the laptop screen.
+        """
+        mon = secondary_monitor()
+        self.on_projector = mon is not None
+        if mon is None:
+            return False
+        x1, y1, x2, y2 = mon
+        w, h = min(self._w, x2 - x1), min(self._h, y2 - y1)
+        x = x1 + max(0, (x2 - x1 - w) // 2)
+        y = y1 + max(0, (y2 - y1 - h) // 2)
+        try:
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            self.on_projector = False
+        return self.on_projector
+
+    def send_behind(self, other: tk.Misc) -> None:
+        """Open without covering *other* (the teacher's console)."""
+        try:
+            self.win.lower(other)
         except Exception:
             pass
 

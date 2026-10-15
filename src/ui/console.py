@@ -36,6 +36,9 @@ DARK = "#15151a"
 PANEL = "#1d1d24"
 TEXT = "#e8e8ee"
 MUTED = "#8b8b98"
+# The right-hand panel (current call + roster) has this fixed width; the video
+# takes everything else.
+SIDE_WIDTH = 460
 
 PHASE_TINT = {
     Phase.IDLE: MUTED,
@@ -72,8 +75,12 @@ class Console:
         self.gpu = GpuMonitor()
 
         root.title(APP_TITLE)
-        root.geometry("1560x920")
-        root.minsize(1100, 700)
+        # Fit the screen: a window taller than the screen hides its bottom edge
+        # (the call controls and status bar) behind the taskbar.
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1560, sw - 40), min(920, sh - 90)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 20)}")
+        root.minsize(1100, 640)
         root.configure(bg=DARK)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -96,90 +103,151 @@ class Console:
         style.configure("TLabel", background=DARK, foreground=TEXT)
         style.configure("Muted.TLabel", background=DARK, foreground=MUTED)
         style.configure("TButton", padding=(10, 6))
+        style.configure("Group.TLabel", background=DARK, foreground=MUTED,
+                        font=("Segoe UI", 8, "bold"))
+        style.configure("Accent.TButton", foreground="#0d0d10", background="#60a5fa")
+        style.map("Accent.TButton", background=[("active", "#93c5fd")])
+        style.configure("Present.TButton", foreground="#0d0d10", background="#4ade80")
+        style.map("Present.TButton", background=[("active", "#86efac")])
+        style.configure("Absent.TButton", foreground="#0d0d10", background="#fb7185")
+        style.map("Absent.TButton", background=[("active", "#fda4af")])
         style.configure("Treeview", background=PANEL, fieldbackground=PANEL,
                         foreground=TEXT, rowheight=24, borderwidth=0)
         style.configure("Treeview.Heading", background=DARK, foreground=MUTED)
         style.map("Treeview", background=[("selected", "#2f4f7a")])
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=10)
+        """Lay out the window so that nothing can push anything else off screen.
+
+        Measured on the previous layout: one long message in the call panel (the
+        seat-memory explanation) grew the window from 1560 to 1920 px wide and
+        pushed Present / Absent / Undo out of view - exactly when the teacher was
+        being asked to press them - while the video area changed size with every
+        status change. Here every region has a size decided by the window, never
+        by its contents:
+
+        * the video is a Canvas that requests a token size and draws the frame
+          letterboxed into whatever space it is given;
+        * the right panel has a fixed width, and its message text wraps inside
+          it with a fixed number of lines;
+        * the status bar requests no width and clips its text.
+
+        The call panel sits at the top of the right column so the manual
+        controls stay visible beside the video, and the video gets the full
+        height of the window.
+        """
+        outer = ttk.Frame(self.root, padding=(10, 8, 10, 8))
         outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        # --- toolbar ------------------------------------------------------
+        # --- toolbar: grouped by when in the lesson each is used ------------
         bar = ttk.Frame(outer)
-        bar.pack(fill="x", pady=(0, 10))
-        self.btn_load = ttk.Button(bar, text="Load CSV", command=self.load_csv)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        def group(caption: str) -> ttk.Frame:
+            box = ttk.Frame(bar)
+            box.pack(side="left", padx=(0, 14))
+            ttk.Label(box, text=caption, style="Group.TLabel").pack(anchor="w")
+            row = ttk.Frame(box)
+            row.pack(anchor="w")
+            return row
+
+        g = group("ROLL LIST")
+        self.btn_load = ttk.Button(g, text="Load CSV", command=self.load_csv)
         self.btn_load.pack(side="left")
-        ttk.Button(bar, text="Paste Rolls", command=self.paste_rolls).pack(side="left", padx=(6, 0))
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        self.btn_devices = ttk.Button(bar, text="Start Camera", command=self.start_devices)
+        ttk.Button(g, text="Paste Rolls", command=self.paste_rolls).pack(side="left", padx=(4, 0))
+
+        g = group("CAMERA")
+        self.btn_devices = ttk.Button(g, text="Start Camera", command=self.start_devices)
         self.btn_devices.pack(side="left")
-        ttk.Button(bar, text="Switch Camera", command=self.switch_camera).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="Phone Camera", command=self.phone_camera).pack(side="left", padx=(6, 0))
-        ttk.Button(bar, text="Roll Screen", command=self.open_display).pack(side="left", padx=(6, 0))
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        self.btn_start = ttk.Button(bar, text="Start Attendance", command=self.start_attendance)
+        ttk.Button(g, text="Switch Camera", command=self.switch_camera).pack(side="left", padx=(4, 0))
+        ttk.Button(g, text="Phone Camera", command=self.phone_camera).pack(side="left", padx=(4, 0))
+
+        g = group("ATTENDANCE")
+        self.btn_start = ttk.Button(g, text="Start Attendance", command=self.start_attendance,
+                                    style="Accent.TButton")
         self.btn_start.pack(side="left")
-        self.btn_pause = ttk.Button(bar, text="Pause", command=self.pause)
-        self.btn_pause.pack(side="left", padx=(6, 0))
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="Export", command=self.export).pack(side="left")
-        ttk.Button(bar, text="Reset Marks", command=self.reset_marks).pack(side="left", padx=(6, 0))
+        self.btn_pause = ttk.Button(g, text="Pause", command=self.pause)
+        self.btn_pause.pack(side="left", padx=(4, 0))
+        ttk.Button(g, text="Roll Screen", command=self.open_display).pack(side="left", padx=(4, 0))
 
+        g = group("RECORDS")
+        ttk.Button(g, text="Export", command=self.export).pack(side="left")
+        ttk.Button(g, text="Reset Marks", command=self.reset_marks).pack(side="left", padx=(4, 0))
+
+        # --- body: video | side panel --------------------------------------
         body = ttk.Frame(outer)
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
+        body.grid(row=1, column=0, sticky="nsew")
         body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0, minsize=SIDE_WIDTH)
 
-        # --- left: video + current call -----------------------------------
-        left = ttk.Frame(body)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
+        # A Canvas, not a Label: a Label holding an image asks for the image's
+        # size, so each fitted frame made it a little bigger than the last.
+        self.video_canvas = tk.Canvas(body, bg="#000000", highlightthickness=0, bd=0,
+                                      width=320, height=180)
+        self.video_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self._video_item = self.video_canvas.create_image(0, 0, anchor="center")
+        self._video_text = self.video_canvas.create_text(
+            0, 0, text="Camera not started", fill=MUTED, font=("Segoe UI", 14),
+            justify="center")
 
-        self.video_label = tk.Label(left, bg="#000000", text="Camera not started",
-                                    fg=MUTED, font=("Segoe UI", 14))
-        self.video_label.grid(row=0, column=0, sticky="nsew")
+        side = ttk.Frame(body, width=SIDE_WIDTH)
+        side.grid(row=0, column=1, sticky="nsew")
+        side.grid_propagate(False)
+        side.columnconfigure(0, weight=1)
+        side.rowconfigure(1, weight=1)
 
-        call = ttk.Labelframe(left, text="Current call", padding=10)
-        call.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.lbl_roll = tk.Label(call, text="--", bg=DARK, fg=TEXT,
-                                 font=("Segoe UI", 30, "bold"))
-        self.lbl_roll.pack(side="left")
-        mid = ttk.Frame(call)
-        mid.pack(side="left", padx=18)
-        self.lbl_phase = tk.Label(mid, text="IDLE", bg=DARK, fg=MUTED,
-                                  font=("Segoe UI", 14, "bold"), anchor="w")
-        self.lbl_phase.pack(anchor="w")
-        self.lbl_detail = tk.Label(mid, text="", bg=DARK, fg=MUTED,
-                                   font=("Segoe UI", 11), anchor="w", justify="left")
-        self.lbl_detail.pack(anchor="w")
+        # --- current call ---------------------------------------------------
+        call = tk.Frame(side, bg=PANEL, padx=14, pady=10)
+        call.grid(row=0, column=0, sticky="ew")
+        call.columnconfigure(0, weight=1)
+        tk.Label(call, text="CURRENT CALL", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 9, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+        self.lbl_roll = tk.Label(call, text="--", bg=PANEL, fg=TEXT, anchor="w",
+                                 font=("Segoe UI", 28, "bold"))
+        self.lbl_roll.grid(row=1, column=0, sticky="ew")
+        self.lbl_phase = tk.Label(call, text="IDLE", bg=PANEL, fg=MUTED, anchor="w",
+                                  font=("Segoe UI", 14, "bold"))
+        self.lbl_phase.grid(row=2, column=0, sticky="ew")
+        # Fixed height in text lines and wrapped to the panel: a long message
+        # adds lines inside this box instead of widening the window.
+        self.lbl_detail = tk.Label(call, text="", bg=PANEL, fg=MUTED, anchor="nw",
+                                   justify="left", font=("Segoe UI", 10), height=4,
+                                   wraplength=SIDE_WIDTH - 40)
+        self.lbl_detail.grid(row=3, column=0, sticky="ew", pady=(2, 8))
+        call.bind("<Configure>", lambda e: self.lbl_detail.configure(
+            wraplength=max(120, e.width - 32)))
 
-        btns = ttk.Frame(call)
-        btns.pack(side="right")
-        ttk.Button(btns, text="Present", command=lambda: self.manual(True)).pack(side="left")
-        ttk.Button(btns, text="Absent", command=lambda: self.manual(False)).pack(side="left", padx=6)
-        ttk.Button(btns, text="Undo", command=self.undo).pack(side="left")
+        btns = tk.Frame(call, bg=PANEL)
+        btns.grid(row=4, column=0, sticky="ew")
+        for i in range(3):
+            btns.columnconfigure(i, weight=1, uniform="manual")
+        ttk.Button(btns, text="Present  (P)", style="Present.TButton",
+                   command=lambda: self.manual(True)).grid(row=0, column=0, sticky="ew")
+        ttk.Button(btns, text="Absent  (A)", style="Absent.TButton",
+                   command=lambda: self.manual(False)).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(btns, text="Undo  (U)", command=self.undo).grid(row=0, column=2, sticky="ew")
 
-        # --- right: roster -------------------------------------------------
-        right = ttk.Frame(body)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(0, weight=1)
-        right.columnconfigure(0, weight=1)
+        # --- roster ---------------------------------------------------------
+        roster = ttk.Frame(side)
+        roster.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        roster.rowconfigure(0, weight=1)
+        roster.columnconfigure(0, weight=1)
 
         cols = ("roll", "name", "status", "evidence")
-        self.tree = ttk.Treeview(right, columns=cols, show="headings", selectmode="browse")
-        for key, text, width, anchor in (
-            ("roll", "Roll Number", 150, "w"),
-            ("name", "Name", 130, "w"),
-            ("status", "Status", 80, "center"),
-            ("evidence", "Evidence", 190, "w"),
+        self.tree = ttk.Treeview(roster, columns=cols, show="headings", selectmode="browse")
+        for key, text, width, anchor, stretch in (
+            ("roll", "Roll Number", 118, "w", False),
+            ("name", "Name", 110, "w", True),
+            ("status", "Status", 66, "center", False),
+            ("evidence", "Evidence", 120, "w", True),
         ):
             self.tree.heading(key, text=text)
-            self.tree.column(key, width=width, anchor=anchor)
+            self.tree.column(key, width=width, minwidth=50, anchor=anchor, stretch=stretch)
         self.tree.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
+        sb = ttk.Scrollbar(roster, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.grid(row=0, column=1, sticky="ns")
         self.tree.tag_configure("Present", foreground="#4ade80")
@@ -187,14 +255,16 @@ class Console:
         self.tree.tag_configure("Pending", foreground=MUTED)
         self.tree.tag_configure("current", background="#2a2a36")
 
-        self.lbl_summary = tk.Label(right, text="no roster loaded", bg=DARK, fg=MUTED,
-                                    font=("Segoe UI", 11))
-        self.lbl_summary.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.lbl_summary = tk.Label(roster, text="no roster loaded", bg=DARK, fg=MUTED,
+                                    font=("Segoe UI", 11), anchor="w")
+        self.lbl_summary.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         # --- status bar ----------------------------------------------------
+        # width=1: request no width at all, so a long status line is clipped at
+        # the window edge rather than widening the window.
         self.lbl_status = tk.Label(outer, text="ready", bg=PANEL, fg=MUTED, anchor="w",
-                                   font=("Consolas", 10), padx=8, pady=5)
-        self.lbl_status.pack(fill="x", pady=(10, 0))
+                                   font=("Consolas", 10), padx=8, pady=5, width=1)
+        self.lbl_status.grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
     def _bind_keys(self) -> None:
         # Single keys for the two actions a teacher needs mid-call without looking.
@@ -300,11 +370,41 @@ class Console:
             pass
 
     def open_display(self) -> None:
+        """The Roll Screen button: open the student display, or bring it forward."""
         if self.display is not None and self.display.alive:
             self.display.focus()
             return
+        self._create_display()
+        if self.display.on_projector:
+            self._flash("student display is on the projector - F11 there for fullscreen")
+        else:
+            self._flash("student display opened - F11 for fullscreen")
+
+    def _create_display(self) -> None:
         self.display = RollDisplay(self.root, self.cfg, on_close=self._display_closed)
-        self._flash("student display opened - F11 for fullscreen on the projector")
+        # With a projector connected, the student display goes there.
+        self.display.place_on_secondary_monitor()
+
+    def _open_display_for_attendance(self) -> None:
+        """Start Attendance opens the student display without covering the console.
+
+        Before, it opened in front of the console - on a single screen right over
+        the camera feed - and took keyboard focus, so P / A / U went to the wrong
+        window until the teacher clicked back. Now: on a projector if there is
+        one; otherwise it is opened behind the console (Roll Screen or the
+        taskbar brings it up). Either way the console keeps focus.
+        """
+        if self.display is not None and self.display.alive:
+            return
+        self._create_display()
+        if self.display.on_projector:
+            self._flash("student display is on the projector - F11 there for fullscreen")
+        else:
+            self.display.send_behind(self.root)
+            self._flash("no projector found: student display is behind this window "
+                        "(press Roll Screen to show it)")
+        self.root.lift()
+        self.root.focus_force()
 
     def _display_closed(self) -> None:
         self.display = None
@@ -320,7 +420,7 @@ class Console:
             messagebox.showwarning("Attendance", "The camera and model are still starting.")
             return
         if self.display is None or not self.display.alive:
-            self.open_display()
+            self._open_display_for_attendance()
         self.session.start(time.monotonic())
 
     def pause(self) -> None:
@@ -387,6 +487,9 @@ class Console:
         messagebox.showinfo("Export", "Saved:\n" + "\n".join(str(p) for p in paths))
 
     def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
             self.video.stop()
         except Exception:
@@ -396,8 +499,14 @@ class Console:
         except Exception:
             pass
         if self.display is not None:
-            self.display.close()
-        self.root.destroy()
+            try:
+                self.display.close()
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     # -- the loop ----------------------------------------------------------
     def _tick(self) -> None:
@@ -439,21 +548,31 @@ class Console:
                 text = "Press  Start Camera  to begin"
             else:
                 text = f"starting: {st['stage']}..."
-            self.video_label.configure(image="", text=text)
+            cv = self.video_canvas
+            cv.itemconfigure(self._video_item, image="")
+            cv.coords(self._video_text, cv.winfo_width() / 2, cv.winfo_height() / 2)
+            cv.itemconfigure(self._video_text, text=text,
+                             width=max(200, cv.winfo_width() - 60))
             return
-        lw = max(160, self.video_label.winfo_width())
-        lh = max(120, self.video_label.winfo_height())
+        cv = self.video_canvas
+        lw = max(160, cv.winfo_width())
+        lh = max(120, cv.winfo_height())
         flag = self.session.flag if self.session.phase is Phase.AMBIGUOUS else None
         view = annotate(snap.frame, snap, self.cfg, track_states=self.tracker.states,
                         seats=list(self.gate.seats.values()), flag=flag)
         h, w = view.shape[:2]
+        # Shrink to fit, keeping the aspect ratio; never enlarge (enlarging costs
+        # a resize and a bigger image transfer every frame for no extra detail).
+        # This only changes what is drawn - the canvas's size is set by the window.
         scale = min(lw / w, lh / h)
         if scale < 1.0:
-            view = cv2.resize(view, (int(w * scale), int(h * scale)),
+            view = cv2.resize(view, (max(1, int(w * scale)), max(1, int(h * scale))),
                               interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(view, cv2.COLOR_BGR2RGB)
         self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.video_label.configure(image=self._photo, text="")
+        cv.coords(self._video_item, lw / 2, lh / 2)
+        cv.itemconfigure(self._video_item, image=self._photo)
+        cv.itemconfigure(self._video_text, text="")
 
     def _render_call(self, view) -> None:
         tint = PHASE_TINT.get(view.phase, MUTED)

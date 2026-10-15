@@ -340,9 +340,104 @@ def test_phone_dialog_and_seat_flag() -> None:
         pass
 
 
+def test_layout_is_stable() -> None:
+    section("layout: long messages cannot move or hide anything; Roll Screen stays out of the way")
+    import time as _time
+
+    from ui.console import Console
+
+    root = tk.Tk()
+    video = StubVideo()
+    video._frame = np.full((720, 1280, 3), 60, dtype=np.uint8)
+    tracker = TemporalRaiseTracker(CFG)
+    gate = AttendanceGate(CFG)
+    session = Session(CFG, video, tracker, gate, StubSpeech())
+    session.set_students(make_students(40))
+    con = Console(root, CFG, video, tracker, gate, StubSpeech(), session)
+    con._devices_started = True
+    root.geometry("1400x860")
+
+    def settle(n=12):
+        for _ in range(n):
+            root.update()
+            _time.sleep(0.02)
+
+    settle()
+
+    def boxes():
+        return (con.video_canvas.winfo_width(), con.video_canvas.winfo_height(),
+                con.tree.winfo_width())
+
+    before = boxes()
+    req_before = root.winfo_reqwidth()
+
+    # The longest teacher message the app produces, and then some.
+    session.current = 3
+    session.phase = Phase.AMBIGUOUS
+    session.blocked_reason = session.message = (
+        "2 hands raised (#57 at SP25-BCS-009's seat, #58) - confirm manually; "
+        "hand #57 is at the seat already marked for SP25-BCS-009 (0.05 shoulder-widths "
+        "away, clothing match 97%) - confirm manually")
+    settle(30)
+    after = boxes()
+    check(after == before, "video and roster keep their size with a long message",
+          f"{before} -> {after}")
+    check(root.winfo_reqwidth() <= max(req_before, 1200),
+          "the window does not ask to grow", f"{req_before} -> {root.winfo_reqwidth()}")
+
+    # Every manual control is on screen inside the window.
+    rx, ry = root.winfo_rootx(), root.winfo_rooty()
+    rw, rh = root.winfo_width(), root.winfo_height()
+    found = []
+
+    def walk(w):
+        for c in w.winfo_children():
+            try:
+                if str(c.cget("text")).startswith(("Present", "Absent", "Undo")):
+                    found.append(c)
+            except Exception:
+                pass
+            walk(c)
+
+    walk(root)
+    inside = all(
+        c.winfo_ismapped()
+        and c.winfo_rootx() >= rx and c.winfo_rooty() >= ry
+        and c.winfo_rootx() + c.winfo_width() <= rx + rw
+        and c.winfo_rooty() + c.winfo_height() <= ry + rh
+        for c in found
+    )
+    check(len(found) == 3 and inside, "Present / Absent / Undo are fully visible",
+          f"{len(found)} found")
+    detail = con.lbl_detail
+    check(detail.winfo_rootx() + detail.winfo_width() <= rx + rw,
+          "the message wraps inside the panel instead of running off it")
+
+    # Start Attendance with one screen: the student display opens behind the
+    # console and the console keeps the keyboard.
+    session.phase = Phase.IDLE
+    session.current = -1
+    con.start_attendance()
+    settle(20)
+    check(con.display is not None and con.display.alive, "student display is opened")
+    if con.display is not None and not con.display.on_projector:
+        focus = root.focus_get()
+        check(focus is not None and focus.winfo_toplevel() is root,
+              "the console keeps keyboard focus (P / A / U keep working)",
+              str(focus))
+        order = root.tk.call("wm", "stackorder", ".")
+        disp = str(con.display.win)
+        check(list(order).index(disp) < list(order).index(".") if disp in order else True,
+              "the student display is behind the console, not over the video",
+              str(order))
+    con.close()
+    con.close()  # closing twice (window X, then Ctrl+C) must be harmless
+    check(True, "close() is safe to call twice")
+
+
 def main() -> int:
     for fn in (test_roll_display_all_phases, test_console_builds_and_ticks,
-               test_phone_dialog_and_seat_flag):
+               test_phone_dialog_and_seat_flag, test_layout_is_stable):
         try:
             fn()
         except Exception as exc:

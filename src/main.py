@@ -121,6 +121,11 @@ def main(argv: list[str] | None = None) -> int:
     console = Console(root, cfg, video, tracker, gate, speech, session, exporter=exporter)
     try:
         root.mainloop()
+    except KeyboardInterrupt:
+        # Ctrl+C in the terminal: shut down exactly as closing the window does,
+        # instead of dumping a traceback from inside tkinter.
+        print("Ctrl+C - closing the application...")
+        console.close()
     finally:
         try:
             gate.save_zones(seatmap)
