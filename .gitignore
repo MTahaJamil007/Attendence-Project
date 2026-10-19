@@ -1,5 +1,30 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 .venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project specific
 logs/
 evidence/
 *.pt
@@ -7,3 +32,15 @@ evidence/
 data/seatmap.json
 data/last_camera.json
 platform-tools/
+
+# Node modules (if applicable)
+node_modules/
+npm-debug.log
+
+# OS
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
